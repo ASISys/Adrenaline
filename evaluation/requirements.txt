@@ -1,0 +1,5 @@
+matplotlib
+pytest
+nvtx
+pandas
+datasets

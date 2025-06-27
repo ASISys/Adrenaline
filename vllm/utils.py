@@ -590,6 +590,14 @@ def update_environment_variables(envs: Dict[str, str]):
         os.environ[k] = v
 
 
+def remove_environment_vatiables(envs: List[str]):
+    for k in envs:
+        if k not in os.environ:
+            logger.warning("Environment variable %s does not exist", k)
+            continue
+        os.environ.pop(k)
+
+
 def chunk_list(lst: List[T], chunk_size: int):
     """Yield successive chunk_size chunks from lst."""
     for i in range(0, len(lst), chunk_size):
@@ -1156,7 +1164,7 @@ def weak_bind(bound_method: Callable[..., Any], ) -> Callable[..., None]:
     return weak_bound
 
 
-#From: https://stackoverflow.com/a/4104188/2749989
+# From: https://stackoverflow.com/a/4104188/2749989
 def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:

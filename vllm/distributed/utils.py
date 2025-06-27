@@ -2,6 +2,7 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import dataclasses
 from typing import Sequence, Tuple
 
 import torch
@@ -10,6 +11,7 @@ from torch.distributed.distributed_c10d import (Backend, PrefixStore,
                                                 _get_default_timeout,
                                                 is_nccl_available)
 from torch.distributed.rendezvous import rendezvous
+from typing import Optional
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -157,3 +159,29 @@ def stateless_init_process_group(init_method: str, rank: int, world_size: int,
     pg._register_backend(device, backend_type, backend_class)
 
     return pg
+
+
+@dataclasses.dataclass
+class TransferUtils:
+    hidden_size: int
+    num_kv_heads: int
+    num_layers: int
+    head_size: int
+    max_model_len: int
+    kv_dtype: torch.dtype
+
+    @property
+    def token_kv_size(self):
+        return 2 * self.num_layers * self.num_kv_heads * self.head_size * self.kv_dtype.itemsize
+
+
+def get_element_size(data: Optional[torch.Tensor]):
+    if isinstance(data, torch.Tensor):
+        return data.element_size() * data.numel()
+
+    if not data:
+        # cannot perform `not data` on a tensor
+        # so this check needs to go after the check above
+        return 0
+
+    raise AssertionError("Unknown data type %s" % type(data))

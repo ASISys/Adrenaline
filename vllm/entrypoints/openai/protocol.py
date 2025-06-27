@@ -511,6 +511,7 @@ class CompletionRequest(OpenAIBaseModel):
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
     prompt: Union[List[int], List[List[int]], str, List[str]]
+    request_id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     best_of: Optional[int] = None
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = 0.0
@@ -527,6 +528,10 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    
+    # field added by adrenaline
+    offload: bool = False
+    prefill_rank: int = 0
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False

@@ -9,6 +9,7 @@ from vllm.sequence import (VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData,
                            SequenceGroupMetadata)
 from vllm.utils import (PyObjectCache, async_tensor_h2d,
                         is_pin_memory_available, make_tensor_with_pad)
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 
 _SAMPLING_EPS = 1e-5
 
@@ -151,6 +152,11 @@ class SamplingMetadata:
         pin_memory: bool,
         generators: Optional[Dict[str, torch.Generator]] = None,
         cache: Optional[SamplingMetadataCache] = None,
+        is_prompt: bool = True,
+        num_locals_padded_for_graph: Optional[int] = None,
+        num_offloads_padded_for_graph: Optional[int] = None,
+        num_locals: Optional[int] = None,
+        num_offloads: Optional[list[int]] = None,
     ) -> "SamplingMetadata":
         (
             seq_groups,
@@ -159,6 +165,23 @@ class SamplingMetadata:
             num_prompts,
         ) = _prepare_seq_groups(seq_group_metadata_list, seq_lens, query_lens,
                                 device, generators, cache)
+        if dist_kv.ENABLE_KV_OFFLOAD and not is_prompt:
+            assert num_locals_padded_for_graph is not None
+            assert num_offloads_padded_for_graph is not None
+            assert num_locals is not None
+            assert num_offloads is not None
+            local_selected_indices = list(range(0, num_locals))
+            start_indices = [
+                num_locals_padded_for_graph + idx * num_offloads_padded_for_graph
+                for idx in range(len(num_offloads))
+            ]
+            offload_selected_indices = [
+                list(range(start, start + num_offload))
+                for start, num_offload in zip(start_indices, num_offloads)
+            ]
+            selected_token_indices = local_selected_indices + sum(
+                offload_selected_indices, []
+            )
         selected_token_indices = async_tensor_h2d(
             selected_token_indices,
             dtype=torch.long,

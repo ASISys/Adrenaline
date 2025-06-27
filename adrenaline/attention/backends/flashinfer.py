@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type
 
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.multimodal import MultiModalPlaceholderMap
 
 try:
@@ -21,45 +22,57 @@ except ImportError:
 import torch
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata,
-                                              AttentionMetadataBuilder,
-                                              AttentionState, AttentionType)
-from vllm.attention.backends.utils import (PAD_SLOT_ID, compute_slot_mapping,
-                                           compute_slot_mapping_start_idx,
-                                           is_block_tables_empty)
+from vllm import _custom_ops as vllm_ops
+from vllm.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    AttentionState,
+    AttentionType,
+)
+from vllm.attention.backends.utils import (
+    PAD_SLOT_ID,
+    compute_slot_mapping,
+    compute_slot_mapping_start_idx,
+    is_block_tables_empty,
+)
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.forward_context import get_forward_context
-from vllm.utils import (async_tensor_h2d, direct_register_custom_op,
-                        get_kv_cache_torch_dtype, make_tensor_with_pad)
-
+from vllm.utils import (
+    async_tensor_h2d,
+    direct_register_custom_op,
+    get_kv_cache_torch_dtype,
+    make_tensor_with_pad,
+)
 if TYPE_CHECKING:
-    from vllm.worker.model_runner import (ModelInputForGPUBuilder,
-                                          ModelInputForGPUWithSamplingMetadata)
+    from vllm.worker.model_runner import (
+        ModelInputForGPUBuilder,
+        ModelInputForGPUWithSamplingMetadata,
+    )
 
 
-class FlashInferBackend(AttentionBackend):
+class AdrenalineFlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "FLASHINFER"
+        return "ADRENALINE_FLASHINFER"
 
     @staticmethod
-    def get_impl_cls() -> Type["FlashInferImpl"]:
-        return FlashInferImpl
+    def get_impl_cls() -> Type["AdrenalineFlashInferImpl"]:
+        return AdrenalineFlashInferImpl
 
     @staticmethod
     def get_metadata_cls() -> Type["AttentionMetadata"]:
-        return FlashInferMetadata
+        return AdrenalineFlashInferMetadata
 
     @staticmethod
-    def get_builder_cls() -> Type["FlashInferMetadataBuilder"]:
-        return FlashInferMetadataBuilder
+    def get_builder_cls() -> Type["AdrenalineFlashInferMetadataBuilder"]:
+        return AdrenalineFlashInferMetadataBuilder
 
     @staticmethod
-    def get_state_cls() -> Type["FlashInferState"]:
-        return FlashInferState
+    def get_state_cls() -> Type["AdrenalineFlashInferState"]:
+        return AdrenalineFlashInferState
 
     @staticmethod
     def get_kv_cache_shape(
@@ -99,7 +112,7 @@ class FlashInferBackend(AttentionBackend):
             raise ValueError(f"Unrecognized FP8 dtype: {kv_cache_dtype}")
 
 
-class FlashInferState(AttentionState):
+class AdrenalineFlashInferState(AttentionState):
 
     def __init__(self, runner):
         self.runner = runner
@@ -178,8 +191,13 @@ class FlashInferState(AttentionState):
         state._prefill_wrapper = self._get_prefill_wrapper()
         return state
 
-    def graph_capture_get_metadata_for_batch(
-            self, batch_size: int, is_encoder_decoder_model: bool = False):
+    def graph_capture_get_metadata_for_offload(
+        self,
+        batch_size: int,
+        is_encoder_decoder_model: bool = False,
+        num_locals: int = 0,
+        num_offloads: int = 0,
+    ):
         assert self._is_graph_capturing
         _indptr_buffer = self._graph_indptr_buffer[:batch_size + 1]
         _last_page_len_buffer = self._graph_last_page_len_buffer[:batch_size]
@@ -196,7 +214,73 @@ class FlashInferState(AttentionState):
             self._graph_indices_buffer, _last_page_len_buffer, "NHD",
             use_tensor_cores)
         if self.runner.kv_cache_dtype.startswith("fp8"):
-            kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+            kv_cache_dtype = AdrenalineFlashInferBackend.get_fp8_dtype_for_flashinfer(
+                self.runner.kv_cache_dtype)
+        else:
+            kv_cache_dtype = get_kv_cache_torch_dtype(
+                self.runner.kv_cache_dtype, self.runner.model_config.dtype)
+
+        paged_kv_indptr_tensor_host = torch.arange(0,
+                                                   batch_size + 1,
+                                                   dtype=torch.int32)
+        paged_kv_indices_tensor_host = torch.arange(0,
+                                                    batch_size,
+                                                    dtype=torch.int32)
+        paged_kv_last_page_len_tensor_host = torch.full((batch_size, ),
+                                                        self.runner.block_size,
+                                                        dtype=torch.int32)
+        query_start_loc_host = torch.arange(0,
+                                            batch_size + 1,
+                                            dtype=torch.int32)
+
+        attn_metadata = self.runner.attn_backend.make_metadata(
+            num_prefills=0,
+            slot_mapping=self._graph_slot_mapping[:batch_size],
+            multi_modal_placeholder_index_maps=None,
+            num_prefill_tokens=0,
+            num_decode_tokens=batch_size,
+            max_prefill_seq_len=0,
+            block_tables=self._graph_block_tables,
+            paged_kv_indptr=paged_kv_indptr_tensor_host,
+            paged_kv_indices=paged_kv_indices_tensor_host,
+            paged_kv_last_page_len=paged_kv_last_page_len_tensor_host,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=self.runner.model_config.get_head_size(),
+            page_size=self.runner.block_size,
+            seq_start_loc=None,
+            query_start_loc=query_start_loc_host,
+            device=self.runner.device,
+            data_type=kv_cache_dtype,
+            q_data_type=self.runner.model_config.dtype,
+            use_cuda_graph=True,
+            decode_wrapper=self._graph_decode_wrapper,
+            prefill_wrapper=None,
+            num_locals=num_locals,
+            num_offloads=num_offloads,
+        )
+        attn_metadata.begin_forward()
+        return attn_metadata
+
+    def graph_capture_get_metadata_for_batch(
+            self, batch_size: int, is_encoder_decoder_model: bool = False):
+        assert self._is_graph_capturing
+        _indptr_buffer = self._graph_indptr_buffer[:batch_size + 1]
+        _last_page_len_buffer = self._graph_last_page_len_buffer[:batch_size]
+
+        num_qo_heads = (self.runner.model_config.get_num_attention_heads(
+            self.runner.parallel_config))
+        num_kv_heads = self.runner.model_config.get_num_kv_heads(
+            self.runner.parallel_config)
+        use_tensor_cores = envs.VLLM_FLASHINFER_FORCE_TENSOR_CORES or (
+            num_qo_heads // num_kv_heads > 4)
+        self._graph_decode_wrapper = \
+            CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self._graph_decode_workspace_buffer, _indptr_buffer,
+                self._graph_indices_buffer, _last_page_len_buffer, "NHD",
+                use_tensor_cores)
+        if self.runner.kv_cache_dtype.startswith("fp8"):
+            kv_cache_dtype = AdrenalineFlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.runner.kv_cache_dtype)
         else:
             kv_cache_dtype = get_kv_cache_torch_dtype(
@@ -257,18 +341,27 @@ class FlashInferState(AttentionState):
     def begin_forward(self, model_input):
         assert not self._is_graph_capturing
         state = self
+        assert isinstance(model_input.attn_metadata, AdrenalineFlashInferMetadata)
         if model_input.attn_metadata.use_cuda_graph:
-            batch_size = model_input.input_tokens.shape[0]
-            state = (self.runner.graph_runners[model_input.virtual_engine]
-                     [batch_size].attn_state)
-        model_input.attn_metadata.prefill_wrapper = state._get_prefill_wrapper(
-        )
+            if dist_kv.ENABLE_KV_OFFLOAD and dist_kv.IS_KV_CONSUMER and model_input.attn_metadata.num_offloads > 0:
+                graph_num_locals = model_input.attn_metadata.num_locals_padded_for_graph
+                graph_num_offloads = model_input.attn_metadata.num_offloads_padded_for_graph
+                state = self.runner.offload_graph_runners[model_input.virtual_engine][
+                    (graph_num_locals, graph_num_offloads)
+                ].attn_state
+            elif dist_kv.IS_ATTN_EXECUTOR:
+                batch_size = model_input.attn_metadata.num_offloads_padded_for_graph
+                state = self.runner.graph_runners[model_input.virtual_engine][batch_size].attn_state
+            else:
+                batch_size = model_input.input_tokens.shape[0]
+                state = self.runner.graph_runners[model_input.virtual_engine][batch_size].attn_state
+        model_input.attn_metadata.prefill_wrapper = state._get_prefill_wrapper()
         model_input.attn_metadata.decode_wrapper = state._get_decode_wrapper()
         model_input.attn_metadata.begin_forward()
 
 
 @dataclass
-class FlashInferMetadata(AttentionMetadata):
+class AdrenalineFlashInferMetadata(AttentionMetadata):
     # Maximum sequence length among prefill batch. 0 if there are decoding
     # requests only.
     max_prefill_seq_len: int
@@ -321,11 +414,16 @@ class FlashInferMetadata(AttentionMetadata):
     q_data_type: torch.dtype = None
     device: torch.device = torch.device("cuda")
     is_profile_run: bool = False
+    num_locals: int = 0
+    num_offloads: int = 0
+
+    num_locals_padded_for_graph: int = 0
+    num_offloads_padded_for_graph: int = 0
 
     def __post_init__(self):
         # Refer to
         # https://github.com/flashinfer-ai/flashinfer/blob/3d55c71a62052c590c130897d3a3db49b14fcc34/include/flashinfer/utils.cuh#L157
-        supported_head_sizes = FlashInferBackend.get_supported_head_sizes()
+        supported_head_sizes = AdrenalineFlashInferBackend.get_supported_head_sizes()
         if self.head_dim is not None and self.head_dim \
                 not in supported_head_sizes:
             raise ValueError(
@@ -364,7 +462,9 @@ class FlashInferMetadata(AttentionMetadata):
                     self.paged_kv_indices,
                     self.paged_kv_last_page_len[:self.num_prefills],
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
-                    self.page_size)
+                    self.page_size,
+                    q_data_type=self.q_data_type,
+                )
         if self.num_decode_tokens > 0:
             assert self.paged_kv_indices is not None
             assert self.paged_kv_indptr is not None
@@ -408,14 +508,25 @@ class FlashInferMetadata(AttentionMetadata):
         return super().asdict_zerocopy(skip_fields)
 
     @property
-    def prefill_metadata(self) -> Optional["FlashInferMetadata"]:
+    def prefill_metadata(self) -> Optional["AdrenalineFlashInferMetadata"]:
         if self.num_prefills == 0:
             return None
         return self
 
     @property
-    def decode_metadata(self) -> Optional["FlashInferMetadata"]:
-        if self.num_decode_tokens == 0:
+    def decode_metadata(self) -> Optional["AdrenalineFlashInferMetadata"]:
+        if dist_kv.IS_KV_PRODUCER:
+            if self.num_prefill_tokens > 0:
+                assert self.num_decode_tokens == 0
+                return None
+            else:
+                # prefill instance has decode metadata only in cuda graph capture mode
+                # the proxy ensure prefill has not decode stage by setting max_token to 1
+                return self
+        # TODO: split offload tokens and local tokens from prefill and decode
+        if self.num_decode_tokens == 0 and (
+            self.num_offloads is None or self.num_offloads == 0
+        ):
             return None
         return self
 
@@ -450,7 +561,7 @@ class FlashInferMetadata(AttentionMetadata):
         model_input.input_tokens[:num_queries] = sampled_token_ids.flatten()
 
         # Update GPU tensors
-        ops.advance_step_flashinfer(
+        vllm_ops.advance_step_flashinfer(
             num_seqs=num_seqs,
             num_queries=num_queries,
             block_size=block_size,
@@ -466,7 +577,7 @@ class FlashInferMetadata(AttentionMetadata):
             block_table_bound=self.block_table_bound)
 
 
-class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+class AdrenalineFlashInferMetadataBuilder(AttentionMetadataBuilder[AdrenalineFlashInferMetadata]):
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.slot_mapping: List[int] = []
@@ -592,8 +703,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             last_page_len = self.block_size
         self.paged_kv_last_page_len.append(last_page_len)
 
-    def build(self, seq_lens: List[int], query_lens: List[int],
-              cuda_graph_pad_size: int, batch_size: int):
+    def build(
+        self,
+        seq_lens: List[int],
+        query_lens: List[int],
+        cuda_graph_pad_size: int,
+        batch_size: int,
+        num_locals: Optional[int] = None,
+        num_offloads: Optional[int] = None,
+    ):
         """Build attention metadata with on-device tensors.
 
         Args:
@@ -603,9 +721,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                  -1 if cuda graph is not used.
             batch_size: The maybe padded batch size.
         """
-        for inter_data in self.input_builder.inter_data_list:
-            self._add_seq_group(inter_data,
-                                self.input_builder.chunked_prefill_enabled)
+        for idx, inter_data in enumerate(self.input_builder.inter_data_list):
+            offload_flag = num_locals is not None and idx >= num_locals
+            if (dist_kv.ENABLE_KV_OFFLOAD and dist_kv.IS_KV_CONSUMER and offload_flag) or (
+                dist_kv.IS_ATTN_EXECUTOR and inter_data.prefill_rank != dist_kv.get_attn_rank()
+            ):
+                continue
+            self._add_seq_group(inter_data, self.input_builder.chunked_prefill_enabled)
 
         device = self.runner.device
         use_captured_graph = cuda_graph_pad_size != -1
@@ -701,13 +823,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             block_table_bound_tensor = None
 
         if self.runner.kv_cache_dtype.startswith("fp8"):
-            kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+            kv_cache_dtype = AdrenalineFlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.runner.kv_cache_dtype)
         else:
             kv_cache_dtype = get_kv_cache_torch_dtype(
                 self.runner.kv_cache_dtype, self.runner.model_config.dtype)
 
-        return FlashInferMetadata(
+        return AdrenalineFlashInferMetadata(
             decode_query_len=decode_query_len,
             num_prefills=self.num_prefills,
             slot_mapping=slot_mapping_tensor,
@@ -733,10 +855,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             data_type=kv_cache_dtype,
             q_data_type=self.runner.model_config.dtype,
             use_cuda_graph=use_captured_graph,
-            is_profile_run=self.is_profile_run)
+            is_profile_run=self.is_profile_run,
+            num_locals=num_locals,
+            num_offloads=num_offloads,
+        )
 
 
-class FlashInferImpl(AttentionImpl):
+class AdrenalineFlashInferImpl(AttentionImpl):
 
     def __init__(
         self,
@@ -772,7 +897,7 @@ class FlashInferImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashInferMetadata,
+        attn_metadata: AdrenalineFlashInferMetadata,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         attn_type: AttentionType = AttentionType.DECODER,
@@ -783,7 +908,7 @@ class FlashInferImpl(AttentionImpl):
                                       "are not implemented for "
                                       "FlashInferImpl")
 
-        return torch.ops.vllm.unified_flash_infer(
+        return torch.ops.vllm.adrenaline_unified_flash_infer(
             query,
             key,
             value,
@@ -800,8 +925,139 @@ class FlashInferImpl(AttentionImpl):
             self.logits_soft_cap,
         )
 
+    def forward_with_blk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AdrenalineFlashInferMetadata,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        attn_type: AttentionType = AttentionType.DECODER,
+    ):
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError(
+                "Encoder self-attention and encoder/decoder cross-attention are not implemented for FlashInferImpl"
+            )
+        
+        num_heads = self.num_heads
+        head_size = self.head_size
+        num_kv_heads = self.num_kv_heads
+        softmax_scale = self.scale
+        kv_cache_dtype = self.kv_cache_dtype
+        window_size = self.sliding_window
+        alibi_slopes = self.alibi_slopes
+        logits_soft_cap = self.logits_soft_cap
 
-def unified_flash_infer(
+        current_metadata = get_forward_context()
+        assert current_metadata is not None
+        assert isinstance(current_metadata, AdrenalineFlashInferMetadata)
+        attn_metadata: AdrenalineFlashInferMetadata = current_metadata
+
+        num_tokens, hidden_size = query.shape
+        query = query.view(-1, num_heads, head_size)
+        key = key.view(-1, num_kv_heads, head_size)
+        value = value.view(-1, num_kv_heads, head_size)
+
+        if kv_cache.numel() > 0:
+            # Use the same reshape and cache kernel as flash attention.
+            vllm_ops.reshape_and_cache_flash(
+                key,
+                value,
+                kv_cache[:, 0],
+                kv_cache[:, 1],
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+            # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
+            # to process the cache when the kv_cache_dtype is fp8
+            if kv_cache_dtype.startswith("fp8"):
+                torch_dtype = AdrenalineFlashInferBackend.get_fp8_dtype_for_flashinfer(
+                    kv_cache_dtype)
+                kv_cache = kv_cache.view(torch_dtype)
+
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        assert key.shape[0] == num_prefill_tokens + num_decode_tokens, \
+                    f"key : {key.shape} : #prefill tokens {num_prefill_tokens} : #decode tokens {num_decode_tokens}" # noqa
+        assert value.shape[0] == num_prefill_tokens + num_decode_tokens, \
+                    f"value : {value.shape} : #prefill toks {num_prefill_tokens} : #decode toks {num_decode_tokens}" # noqa
+        query = query.contiguous()  # Flashinfer requires query to be contiguous
+        # Query for decode. KV is not needed because it is already cached.
+        # QKV for prefill.
+        decode_query = query[num_prefill_tokens:]
+        query = query[:num_prefill_tokens]
+
+        key = key[:num_prefill_tokens]
+        value = value[:num_prefill_tokens]
+
+        assert query.shape[0] == num_prefill_tokens
+        assert decode_query.shape[0] == num_decode_tokens
+
+        prefill_output: Optional[torch.Tensor] = None
+        decode_output: Optional[torch.Tensor] = None
+        if prefill_meta := attn_metadata.prefill_metadata:
+            # We will use flash attention for prefill
+            # when kv_cache is not provided.
+            # This happens when vllm runs the profiling to
+            # determine the number of blocks.
+            if kv_cache.numel() == 0:
+                prefill_output = flash_attn_varlen_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=prefill_meta.seq_start_loc,
+                    cu_seqlens_k=prefill_meta.seq_start_loc,
+                    max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                    max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                )
+            else:
+                assert prefill_meta is not None
+                assert prefill_meta.prefill_wrapper is not None
+                prefill_output = prefill_meta.prefill_wrapper.forward(
+                    query,
+                    kv_cache,
+                    logits_soft_cap=logits_soft_cap,
+                    causal=True,
+                    k_scale=k_scale,
+                    v_scale=v_scale)
+        if decode_meta := attn_metadata.decode_metadata:
+            assert attn_metadata.decode_metadata is not None
+            assert attn_metadata.decode_metadata.decode_wrapper is not None
+            decode_output = attn_metadata.decode_metadata.decode_wrapper.forward(
+                decode_query,
+                kv_cache,
+                sm_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale)
+
+        if prefill_output is None and decode_output is not None:
+            # Decode only batch.
+            output, num_tokens = decode_output, num_decode_tokens
+        elif decode_output is None and prefill_output is not None:
+            # Prefill only batch.
+            output, num_tokens = prefill_output, num_prefill_tokens
+        else:
+            # Chunked prefill batch does not work with speculative decoding in
+            # FlashInfer backend, so the query length for decode should be 1.
+            assert prefill_output is not None
+            assert decode_output is not None
+            assert decode_meta is not None
+            assert decode_meta.decode_query_len == 1
+            decode_output = decode_output.squeeze(1)
+            output = torch.cat([prefill_output, decode_output], dim=0)
+        return output.view(num_tokens, hidden_size)
+
+
+def adrenaline_unified_flash_infer(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -820,8 +1076,8 @@ def unified_flash_infer(
 
     current_metadata = get_forward_context()
     assert current_metadata is not None
-    assert isinstance(current_metadata, FlashInferMetadata)
-    attn_metadata: FlashInferMetadata = current_metadata
+    assert isinstance(current_metadata, AdrenalineFlashInferMetadata)
+    attn_metadata: AdrenalineFlashInferMetadata = current_metadata
 
     num_tokens, hidden_size = query.shape
     query = query.view(-1, num_heads, head_size)
@@ -830,7 +1086,7 @@ def unified_flash_infer(
 
     if kv_cache.numel() > 0:
         # Use the same reshape and cache kernel as flash attention.
-        ops.reshape_and_cache_flash(
+        vllm_ops.reshape_and_cache_flash(
             key,
             value,
             kv_cache[:, 0],
@@ -843,7 +1099,7 @@ def unified_flash_infer(
         # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
         # to process the cache when the kv_cache_dtype is fp8
         if kv_cache_dtype.startswith("fp8"):
-            torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+            torch_dtype = AdrenalineFlashInferBackend.get_fp8_dtype_for_flashinfer(
                 kv_cache_dtype)
             kv_cache = kv_cache.view(torch_dtype)
 
@@ -925,7 +1181,7 @@ def unified_flash_infer(
     return output.view(num_tokens, hidden_size)
 
 
-def unified_flash_infer_fake(
+def adrenaline_unified_flash_infer_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -945,8 +1201,8 @@ def unified_flash_infer_fake(
 
 
 direct_register_custom_op(
-    op_name="unified_flash_infer",
-    op_func=unified_flash_infer,
+    op_name="adrenaline_unified_flash_infer",
+    op_func=adrenaline_unified_flash_infer,
     mutates_args=["kv_cache"],
-    fake_impl=unified_flash_infer_fake,
+    fake_impl=adrenaline_unified_flash_infer_fake,
 )

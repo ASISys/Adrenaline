@@ -7,7 +7,10 @@ from typing import Tuple, Union, cast
 from fastapi import Request
 
 from vllm.config import ModelConfig
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.engine.protocol import EngineClient
+from vllm.engine.multiprocessing import RecvOffloadRequestFlag
+from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.entrypoints.logger import RequestLogger
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -86,7 +89,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 "suffix is not currently supported")
 
         model_name = self.base_model_paths[0].name
-        request_id = f"cmpl-{random_uuid()}"
+        request_id = request.request_id
         created_time = int(time.time())
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -113,7 +116,7 @@ class OpenAIServingCompletion(OpenAIServing):
             return self.create_error_response(str(e))
 
         # Schedule the request and get the result generator.
-        generators: List[AsyncGenerator[RequestOutput, None]] = []
+        generators: List[AsyncGenerator[Union[RequestOutput, RecvOffloadRequestFlag], None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
                 sampling_params: Union[SamplingParams, BeamSearchParams]
@@ -125,6 +128,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 else:
                     sampling_params = request.to_sampling_params(
                         default_max_tokens)
+                sampling_params.offload = request.offload
+                sampling_params.prefill_rank = request.prefill_rank
 
                 request_id_item = f"{request_id}-{i}"
 
@@ -254,6 +259,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                        stream_options.continuous_usage_stats
         else:
             include_usage, include_continuous_usage = False, False
+
+        if dist_kv.IS_ATTN_EXECUTOR:
+            _, flag = await result_generator.__anext__()
+            assert isinstance(flag, RecvOffloadRequestFlag), f"{type(flag)}"
+            yield "data: [Add Offload]\n\n"
 
         try:
             async for prompt_idx, res in result_generator:

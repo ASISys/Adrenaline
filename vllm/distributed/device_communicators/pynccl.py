@@ -34,8 +34,8 @@ class PyNcclCommunicator:
         is bind to a unique device.
         """
         assert dist.is_initialized()
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "PyNcclCommunicator should be attached to a non-NCCL group.")
+        # assert dist.get_backend(group) != dist.Backend.NCCL, (
+        #     "PyNcclCommunicator should be attached to a non-NCCL group.")
         self.group = group
         # note: this rank is the rank in the group
         self.rank = dist.get_rank(group)
@@ -62,19 +62,6 @@ class PyNcclCommunicator:
 
         logger.info("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
 
-        if self.rank == 0:
-            # get the unique id from NCCL
-            self.unique_id = self.nccl.ncclGetUniqueId()
-        else:
-            # construct an empty unique id
-            self.unique_id = ncclUniqueId()
-        tensor = torch.ByteTensor(list(self.unique_id.internal))
-        ranks = dist.get_process_group_ranks(group)
-        # arg `src` in `broadcast` is the global rank
-        dist.broadcast(tensor, src=ranks[0], group=group)
-        byte_list = tensor.tolist()
-        for i, byte in enumerate(byte_list):
-            self.unique_id.internal[i] = byte
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
@@ -82,6 +69,21 @@ class PyNcclCommunicator:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+
+        if self.rank == 0:
+            # get the unique id from NCCL
+            self.unique_id = self.nccl.ncclGetUniqueId()
+        else:
+            # construct an empty unique id
+            self.unique_id = ncclUniqueId()
+        tensor = torch.tensor(list(self.unique_id.internal),
+                              device=self.device)
+        ranks = dist.get_process_group_ranks(group)
+        # arg `src` in `broadcast` is the global rank
+        dist.broadcast(tensor, src=ranks[0], group=group)
+        byte_list = tensor.tolist()
+        for i, byte in enumerate(byte_list):
+            self.unique_id.internal[i] = byte
         # nccl communicator and stream will use this device
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
@@ -96,10 +98,35 @@ class PyNcclCommunicator:
             self.stream.synchronize()
             del data
 
+        with torch.cuda.stream(self.stream):
+            self.warm_up_send_recv()
         # by default it is disabled, e.g. in profiling models and prefill phase.
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
         self.disabled = True
+
+    def warm_up_send_recv(self):
+        """Warm up all point-to-point communication links using send and recv for broadcasting."""
+        current_stream = torch.cuda.current_stream()
+        warm_up_tensor = torch.tensor([1.0, 2.0, 3.0], device=self.device)
+
+        for i in range(self.world_size):  # Round i: Rank i broadcasts
+            if self.rank == i:
+                for j in range(self.world_size):  # Broadcast to all other ranks
+                    if j != i:
+                        self.send(warm_up_tensor, j, current_stream)
+            else:  # Receiving ranks
+                recv_buffer = torch.zeros_like(warm_up_tensor)
+                self.recv(recv_buffer, i, current_stream)
+                assert torch.allclose(recv_buffer, warm_up_tensor)
+
+            current_stream.synchronize()
+            self.group.barrier()  # Round i ends
+
+        logger.info(f"[PYNCCL] rank {self.rank} warm up finished")
+
+    def enable(self):
+        self.disabled = False
 
     def all_reduce(self,
                    tensor: torch.Tensor,
@@ -127,11 +154,25 @@ class PyNcclCommunicator:
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
+
+        # to sync with compute stream
         if stream is None:
-            stream = self.stream
-        self.nccl.ncclSend(buffer_type(tensor.data_ptr()), tensor.numel(),
-                           ncclDataTypeEnum.from_torch(tensor.dtype), dst,
-                           self.comm, cudaStream_t(stream.cuda_stream))
+            current_stream = torch.cuda.current_stream()
+        else:
+            current_stream = stream
+
+        # ncclSend only supports continuous tensor
+        tensor = tensor.contiguous()
+
+        self.nccl.ncclSend(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            ncclDataTypeEnum.from_torch(tensor.dtype),
+            dst,
+            self.comm,
+            cudaStream_t(current_stream.cuda_stream),
+        )
+
 
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
@@ -139,11 +180,24 @@ class PyNcclCommunicator:
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
+
         if stream is None:
-            stream = self.stream
-        self.nccl.ncclRecv(buffer_type(tensor.data_ptr()), tensor.numel(),
-                           ncclDataTypeEnum.from_torch(tensor.dtype), src,
-                           self.comm, cudaStream_t(stream.cuda_stream))
+            current_stream = torch.cuda.current_stream()
+        else:
+            current_stream = stream
+        assert current_stream != torch.cuda.default_stream()
+
+        # ncclRecv only supports continuous tensor
+        tensor = tensor.contiguous()
+
+        self.nccl.ncclRecv(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            ncclDataTypeEnum.from_torch(tensor.dtype),
+            src,
+            self.comm,
+            cudaStream_t(current_stream.cuda_stream),
+        )
 
     @contextmanager
     def change_state(self,

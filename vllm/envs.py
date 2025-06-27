@@ -70,6 +70,13 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_OPS: List[str] = []
     VLLM_DISABLED_KERNELS: List[str] = []
     VLLM_USE_V1: bool = False
+    VLLM_DISTRIBUTED_KV_ROLE: Optional[str] = None
+    VLLM_ENABLE_KV_OFFLOAD: bool = False
+    VLLM_OFFLOAD_RATIO: float = 0
+    VLLM_OFFLOAD_MAX_CAPTURE_BATCH: int = 0
+    VLLM_PREFILL_INSTANCES: int = 1
+    VLLM_DECODE_INSTANCES: int = 1
+    VLLM_RANK_IN_INSTANCES: int = -1
 
 
 def get_default_cache_root():
@@ -393,7 +400,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", "32768")),
 
     # Specify the role of current vllm instance
-    # Value can be "producer", "consumer" or "both".
+    # Value can be "producer", "consumer", "offload" or "both".
     "VLLM_DISTRIBUTED_KV_ROLE":
     lambda: os.getenv("VLLM_DISTRIBUTED_KV_ROLE", None),
 
@@ -470,6 +477,25 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # If set, use the V1 code path.
     "VLLM_USE_V1":
     lambda: bool(int(os.getenv("VLLM_USE_V1", "0"))),
+
+    # If set, enable offloading.
+    "VLLM_ENABLE_KV_OFFLOAD":
+    lambda: bool(int(os.getenv("VLLM_ENABLE_KV_OFFLOAD", "0"))),
+
+    "VLLM_OFFLOAD_RATIO":
+    lambda: float(os.getenv("VLLM_OFFLOAD_RATIO", "0.0")),
+
+    "VLLM_OFFLOAD_MAX_CAPTURE_BATCH":
+    lambda: int(os.getenv("VLLM_OFFLOAD_MAX_CAPTURE_BATCH", "0")),
+
+    "VLLM_PREFILL_INSTANCES":
+    lambda: int(os.getenv("VLLM_PREFILL_INSTANCES", "1")),
+
+    "VLLM_DECODE_INSTANCES":
+    lambda: int(os.getenv("VLLM_DECODE_INSTANCES", "1")),
+
+    "VLLM_RANK_IN_INSTANCES":
+    lambda: int(os.getenv("VLLM_RANK_IN_INSTANCES", "-1")),
 }
 
 # end-env-vars-definition

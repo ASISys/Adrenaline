@@ -38,7 +38,11 @@ from torch.distributed import Backend, ProcessGroup
 
 # Use this import to check if disagg prefill is enabled.
 # if enabled, need to adjust distributed group correspondingly.
-import vllm.distributed.kv_transfer.vllm_adapter as dist_kv
+from vllm.distributed.utils import TransferUtils
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
+from vllm.distributed.kv_transfer.agent.kv_transfer import KV_transfer_agent
+from vllm.distributed.kv_transfer.agent.offload_exec_agent import Offload_attn_exec_agent
+from vllm.distributed.kv_transfer.agent.kv_transfer_in_device import KV_transfer_agent_in_same_device
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -200,14 +204,18 @@ class GroupCoordinator:
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            recving_sync_group = torch.distributed.new_group(ranks, backend="gloo")
+            fin_recv_sync_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+                self.recving_sync_group = recving_sync_group
+                self.fin_recv_sync_group = fin_recv_sync_group
 
-        assert self.cpu_group is not None
+        assert self.cpu_group is not None, f"{self.rank} not in {group_ranks}"
         assert self.device_group is not None
 
         if current_platform.is_cuda_alike():
@@ -951,13 +959,29 @@ def get_pp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
-_DISAGG: Optional[dist_kv.KV_transfer_agent] = None
+_DISAGG: Optional[KV_transfer_agent] = None
 
 
-def get_disagg_group() -> dist_kv.KV_transfer_agent:
+def get_disagg_group() -> KV_transfer_agent:
     assert _DISAGG is not None, (
         "disaggregated prefill parallel group is not initialized")
     return _DISAGG
+
+_OFFLOAD_KV: Optional[KV_transfer_agent_in_same_device] = None
+
+
+def get_offload_kv_group() -> KV_transfer_agent_in_same_device:
+    assert _OFFLOAD_KV is not None, (
+        "disaggregated offload parallel group is not initialized")
+    return _OFFLOAD_KV
+
+
+_OFFLOAD_EXEC: Optional[Offload_attn_exec_agent] = None
+
+
+def get_offload_group() -> Offload_attn_exec_agent:
+    assert _OFFLOAD_EXEC is not None, "disaggregated offloading group is not initialized"
+    return _OFFLOAD_EXEC
 
 
 @contextmanager
@@ -990,32 +1014,24 @@ def set_custom_all_reduce(enable: bool):
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
 
-def include_decoding_groups_if_disagg_enabled(
-    groups: List[List[int]],
-    world_size: int,
-) -> List[List[int]]:
+def extend_ranks(
+    groups: list[list[int]], world_size_per_role: int, repeat_times: int
+) -> list[list[int]]:
     """
-        Include the distributed group for decode
-        Only for disaggregated prefill
-        
         Example:
-            Original group: [ [0,1], [2,3] ], world_size = 4
+            Original group: [ [0,1], [2,3] ], world_size = 4, repeat_times = 2
             Extended: [ [0,1], [2,3], [4,5], [6,7] ]
         Arguments:
             groups: original distributed group
-            world_size: the vLLM world size, which is half of 
-            torch.distributed.get_world_size()
+            world_size: the vLLM world size (world size per kv_role)
+            num_roles: number of repeat times
     """
-
-    if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
-        new_groups = []
-        for group in groups:
-            new_groups.append([rank for rank in group])
-        for group in groups:
-            new_groups.append([rank + world_size for rank in group])
-        return new_groups
-    else:
-        return groups
+    new_groups = [
+        [rank + world_size_per_role * i for rank in group]
+        for i in range(repeat_times)
+        for group in groups
+    ]
+    return new_groups
 
 
 def init_distributed_environment(
@@ -1035,28 +1051,27 @@ def init_distributed_environment(
             "distributed environment")
         # this backend is used for WORLD
 
-        # offset world size and rank in disaggregated prefill scenario
-        maybe_disagg_world_size = world_size
-        maybe_disagg_rank = rank
+        world_size_per_instance = world_size
+        rank_in_instance = rank
+        logger.debug(f"{dist_kv.NUM_PREFILL_INSTANCES=}, {dist_kv.NUM_DECODE_INSTANCES=}, {dist_kv.NUM_ATTN_INSTANCES=}, {dist_kv.INSTANCE_RANK=}")
+        num_total_instances = get_num_instances()
         if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
-            maybe_disagg_world_size = world_size * 2
             logger.debug("Distributed KV transfer enabled.")
-            if dist_kv.IS_KV_PRODUCER:
-                # for prefill, the ranks are [0, world_size)
-                logger.debug("rank %d is KV producer.", rank)
-                maybe_disagg_rank = rank
-            else:
-                # this is decode instance.
-                # offset global rank by tp * pp (which is world_size)
-                maybe_disagg_rank = rank + world_size
-                logger.debug("rank %d is KV consumer, adjust it to %d", rank,
-                             maybe_disagg_rank)
+            if dist_kv.ENABLE_KV_OFFLOAD:
+                logger.debug("enable KV Cache offloading.")
 
+            world_size = world_size_per_instance * num_total_instances
+            rank = rank_in_instance + world_size_per_instance * dist_kv.INSTANCE_RANK
+            logger.debug(f"rank {rank_in_instance} adjusted to {rank}")
+            logger.debug(f"{dist_kv.IS_KV_PRODUCER=}, {dist_kv.IS_KV_CONSUMER=}, {dist_kv.IS_ATTN_EXECUTOR=}")
+
+        logger.debug(f"init process group with {rank=}, {world_size=}")
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
-            world_size=maybe_disagg_world_size,
-            rank=maybe_disagg_rank)
+            world_size=world_size,
+            rank=rank,
+        )
         logger.debug("torch.distributed initialized")
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -1073,27 +1088,38 @@ def init_distributed_environment(
     if _WORLD is None:
         # in single node single process the world size can be -1
         # need to infer the world size from torch.distributed.get_world_size()
-        torch_dist_world_size = torch.distributed.get_world_size()
+        world_size = torch.distributed.get_world_size()
+        if world_size_per_instance == -1:
+            # only for testing
+            world_size_per_instance = world_size
+        ranks = [[i for i in range(world_size_per_instance)]]
         if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
-            # two vLLM instances in the world
-            # so this vLLM instance's world size is half of torch's world size
-            torch_dist_world_size = torch_dist_world_size // 2
-        ranks = [[i for i in range(torch_dist_world_size)]]
-        ranks = include_decoding_groups_if_disagg_enabled(ranks, world_size)
+            ranks = extend_ranks(ranks, world_size_per_instance, num_total_instances)
 
         _WORLD = init_world_group(ranks, local_rank, backend)
-        logger.debug("_WORLD initialized for rank %d",
-                     torch.distributed.get_rank())
+        logger.debug(f"_WORLD initialized for rank {torch.distributed.get_rank()}")
         time.sleep(5)
     else:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size")
+
+def get_num_instances():
+    if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
+        num_total_instances = (
+            dist_kv.NUM_PREFILL_INSTANCES
+            + dist_kv.NUM_DECODE_INSTANCES
+            + dist_kv.NUM_ATTN_INSTANCES
+        )
+    else:
+        num_total_instances = 1
+    return num_total_instances
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    transfer_utils: Optional[TransferUtils] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1140,83 +1166,132 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
+    num_total_instances = get_num_instances()
+    world_size_per_instance = world_size // num_total_instances
     if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
-        # Disaggregated prefill enabled
-        # This vLLM instance thinks its word size is tp * pp, but
-        # torch.distributed contains 2 vLLM instances,
-        # its world size is 2 * tp * pp
-        # Adjust the world_size to match.
-        world_size = world_size // 2
+        world_size_per_instance = world_size // num_total_instances
 
-    if (world_size !=
+    if (world_size_per_instance !=
             tensor_model_parallel_size * pipeline_model_parallel_size):
         raise RuntimeError(
-            f"world_size ({world_size}) is not equal to "
+            f"world_size ({world_size_per_instance}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})")
 
     # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = (world_size //
+    num_tensor_model_parallel_groups: int = (world_size_per_instance //
                                              tensor_model_parallel_size)
     global _TP
     assert _TP is None, ("tensor model parallel group is already initialized")
     group_ranks = []
     for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size,
-                  (i + 1) * tensor_model_parallel_size))
+        ranks = list(range(
+            i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size
+        ))
         group_ranks.append(ranks)
-    group_ranks = include_decoding_groups_if_disagg_enabled(
-        group_ranks, world_size)
+    if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
+        group_ranks = extend_ranks(group_ranks, world_size_per_instance, num_total_instances)
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank,
                                     backend,
                                     use_message_queue_broadcaster=True,
                                     group_name="tp")
-    logger.debug("_TP initialized for rank %d", torch.distributed.get_rank())
+    logger.debug(f"_TP initialized for rank {torch.distributed.get_rank()} with {group_ranks=}")
 
     # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = (world_size //
+    num_pipeline_model_parallel_groups: int = (world_size_per_instance //
                                                pipeline_model_parallel_size)
     global _PP
     assert _PP is None, (
         "pipeline model parallel group is already initialized")
     group_ranks = []
     for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+        ranks = list(range(i, world_size_per_instance, num_pipeline_model_parallel_groups))
         group_ranks.append(ranks)
-    group_ranks = include_decoding_groups_if_disagg_enabled(
-        group_ranks, world_size)
+    if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
+        group_ranks = extend_ranks(group_ranks, world_size_per_instance, num_total_instances)
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank,
                                     backend,
                                     use_custom_allreduce=False,
                                     group_name="pp")
-    logger.debug("_PP initialized for rank %d", torch.distributed.get_rank())
+    logger.debug(f"_PP initialized for rank {torch.distributed.get_rank()} with {group_ranks=}")
 
     if dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
         global _DISAGG
-        logger.debug("Disaggregated prefill enabled, create _DISAGG group")
-        group_ranks = []
-        for i in range(world_size):
-            # prefill local rank: i
-            # decode global rank: i + world_size
-            group_ranks.append([i, i + world_size])
-        logger.debug("Distributed group is %s", str(group_ranks))
-        _DISAGG = dist_kv.KV_transfer_agent(
+        group_ranks: list[list[list[int]]] = []
+        assert dist_kv.NUM_DECODE_INSTANCES == 1
+        for prefill_instance_rank in range(dist_kv.NUM_PREFILL_INSTANCES):
+            group_ranks_per_instance: list[list[int]] = []
+            decode_instance_rank = dist_kv.NUM_PREFILL_INSTANCES
+            for rank_in_instance in range(world_size_per_instance):
+                prefill_rank = rank_in_instance + world_size_per_instance * prefill_instance_rank
+                decode_rank = rank_in_instance + world_size_per_instance * decode_instance_rank
+                group_ranks_per_instance.append([prefill_rank, decode_rank])
+            group_ranks.append(group_ranks_per_instance)
+        _DISAGG = KV_transfer_agent(
             group_ranks=group_ranks,
             local_rank=get_world_group().local_rank,
+            transfer_utils=transfer_utils,
         )
-        logger.debug("_DISAGG initialized for rank %d",
-                     torch.distributed.get_rank())
+        logger.debug(f"_DISAGG initialized for rank {torch.distributed.get_rank()} with {group_ranks=}")
+
+    if dist_kv.IS_DISTRIBUTED_KV_INSTANCE and dist_kv.ENABLE_KV_OFFLOAD:
+        global _OFFLOAD_KV
+        group_ranks: list[list[list[int]]] = []
+        assert dist_kv.NUM_DECODE_INSTANCES == 1
+        assert dist_kv.NUM_PREFILL_INSTANCES == dist_kv.NUM_ATTN_INSTANCES
+        for prefill_instance_rank in range(dist_kv.NUM_PREFILL_INSTANCES):
+            group_ranks_per_instance: list[list[int]] = []
+            attn_instance_rank = (
+                dist_kv.NUM_PREFILL_INSTANCES
+                + dist_kv.NUM_DECODE_INSTANCES
+                + prefill_instance_rank
+            )
+            for rank_in_instance in range(world_size_per_instance):
+                prefill_rank = rank_in_instance + world_size_per_instance * prefill_instance_rank
+                attn_rank = rank_in_instance + world_size_per_instance * attn_instance_rank
+                group_ranks_per_instance.append([prefill_rank, attn_rank])
+            group_ranks.append(group_ranks_per_instance)
+        _OFFLOAD_KV = KV_transfer_agent_in_same_device(
+            group_ranks=group_ranks,
+            local_rank=get_world_group().local_rank,
+            transfer_utils=transfer_utils,
+        )
+        logger.debug(f"_OFFLOAD_KV initialized for rank {torch.distributed.get_rank()} with {group_ranks=}")
+
+        global _OFFLOAD_EXEC
+        group_ranks: list[list[int]] = []
+        assert dist_kv.NUM_PREFILL_INSTANCES == dist_kv.NUM_ATTN_INSTANCES
+        decode_instance_rank = dist_kv.NUM_PREFILL_INSTANCES
+        decode_master_rank = world_size_per_instance * decode_instance_rank
+        for rank_in_instance in range(world_size_per_instance):
+            decode_rank = decode_master_rank + rank_in_instance
+            offload_exec_ranks: list[int] = [decode_rank]
+            for prefill_instance_rank in range(dist_kv.NUM_PREFILL_INSTANCES):
+                attn_instance_rank = (
+                    dist_kv.NUM_PREFILL_INSTANCES
+                    + dist_kv.NUM_DECODE_INSTANCES
+                    + prefill_instance_rank
+                )
+                attn_rank = world_size_per_instance * attn_instance_rank + rank_in_instance
+                offload_exec_ranks.append(attn_rank)
+            group_ranks.append(offload_exec_ranks)
+        _OFFLOAD_EXEC = Offload_attn_exec_agent(
+            group_ranks=group_ranks,
+            local_rank=get_world_group().local_rank,
+            decode_master_rank=decode_master_rank,
+        )
+        logger.debug(f"_OFFLOAD_EXEC initialized for rank {torch.distributed.get_rank()} with {group_ranks=}")
 
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    transfer_utils: Optional[TransferUtils] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1225,8 +1300,12 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
-        initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+        initialize_model_parallel(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            backend,
+            transfer_utils=transfer_utils,
+        )
         return
 
     assert (
@@ -1300,6 +1379,16 @@ def destroy_model_parallel():
     if _DISAGG:
         _DISAGG.destroy()
     _DISAGG = None
+
+    global _OFFLOAD_KV
+    if _OFFLOAD_KV:
+        _OFFLOAD_KV.destroy()
+    _OFFLOAD_KV = None
+
+    global _OFFLOAD_EXEC
+    if _OFFLOAD_EXEC:
+        _OFFLOAD_EXEC.destroy()
+    _OFFLOAD_EXEC = None
 
 
 def destroy_distributed_environment():

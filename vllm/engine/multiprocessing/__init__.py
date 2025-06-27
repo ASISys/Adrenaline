@@ -120,7 +120,11 @@ class RPCUProfileRequest(Enum):
 RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
                       RPCUProfileRequest]
 
-REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCError]
+@dataclass
+class RecvOffloadRequestFlag:
+    request_id: str
+
+REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCError, RecvOffloadRequestFlag]
 
 
 def ENGINE_DEAD_ERROR(

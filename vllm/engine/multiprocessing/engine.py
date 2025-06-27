@@ -8,7 +8,9 @@ import zmq
 
 import vllm.envs
 from vllm import AsyncEngineArgs, SamplingParams
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.engine.llm_engine import LLMEngine
+from vllm.engine.multiprocessing import RecvOffloadRequestFlag
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
@@ -271,6 +273,9 @@ class MQLLMEngine:
                 trace_headers=request.trace_headers,
                 prompt_adapter_request=request.prompt_adapter_request,
                 priority=request.priority)
+
+            if dist_kv.IS_ATTN_EXECUTOR:
+                self._send_outputs(RecvOffloadRequestFlag(request_id))
 
             if self.log_requests:
                 logger.info("Added request %s.", request.request_id)

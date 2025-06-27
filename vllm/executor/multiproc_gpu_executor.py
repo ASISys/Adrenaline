@@ -18,7 +18,7 @@ from vllm.triton_utils import maybe_set_triton_cache_manager
 from vllm.utils import (_run_task_with_lock, cuda_device_count_stateless,
                         cuda_is_initialized, get_distributed_init_method,
                         get_open_port, get_vllm_instance_id, make_async,
-                        update_environment_variables)
+                        update_environment_variables, get_ip)
 
 logger = init_logger(__name__)
 
@@ -67,7 +67,7 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         # Since it only works for single node, we can use the loopback address
         # 127.0.0.1 for communication.
         distributed_init_method = get_distributed_init_method(
-            "127.0.0.1",
+            get_ip(),
             get_open_port(force=dist_kv.IS_DISTRIBUTED_KV_INSTANCE))
 
         self.workers: List[ProcessWorkerWrapper] = []

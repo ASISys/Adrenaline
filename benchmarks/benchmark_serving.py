@@ -36,7 +36,7 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
 
 import numpy as np
-from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
+from benchmarks.backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
 from datasets import load_dataset
 from PIL.Image import Image
@@ -46,12 +46,14 @@ from transformers import PreTrainedTokenizerBase
 try:
     from vllm.transformers_utils.tokenizer import get_tokenizer
 except ImportError:
-    from backend_request_func import get_tokenizer
+    from benchmarks.backend_request_func import get_tokenizer
 
 try:
     from vllm.utils import FlexibleArgumentParser
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
+
+from benchmarks.dataset_utils import Dataset
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -294,6 +296,21 @@ def sample_random_requests(
     return input_requests
 
 
+def sample_dataset_requests(
+    dataset_path: str, num_prompts: int
+) -> List[Tuple[str, int, int, None]]:
+    """
+    sample_requests: Sample the given number of requests from the dataset.
+    """
+    dataset = Dataset.load(dataset_path)
+    if num_prompts > len(dataset.reqs):
+        raise ValueError(
+            f"Number of prompts ({num_prompts}) is larger than the dataset size ({len(dataset.reqs)})."
+        )
+    samples = random.sample(dataset.reqs, num_prompts)
+    return [(req.prompt, req.prompt_len, req.output_len, None) for req in samples]
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -339,6 +356,8 @@ def calculate_metrics(
             output_len = len(
                 tokenizer(outputs[i].generated_text,
                           add_special_tokens=False).input_ids)
+            # FIXME: This is a temporary fix for dummy weight forward
+            output_len = len(outputs[i].itl)
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
             tpot = 0
@@ -433,6 +452,8 @@ async def benchmark(
     ignore_eos: bool,
     gootput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
+    print_stable_throughput: bool,
+    sample_range: Optional[tuple[float, float]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -539,6 +560,53 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    if sample_range is not None:
+        result = process_outputs(
+            input_requests=input_requests,
+            outputs=outputs,
+            benchmark_duration=benchmark_duration,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            gootput_config_dict=gootput_config_dict,
+            sample_range=sample_range,
+        )
+        return result
+
+    result = process_outputs(
+        input_requests=input_requests,
+        outputs=outputs,
+        benchmark_duration=benchmark_duration,
+        tokenizer=tokenizer,
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        gootput_config_dict=gootput_config_dict,
+        print_stable_throughput=print_stable_throughput,
+    )
+
+    return result
+
+
+def process_outputs(
+    input_requests,
+    outputs,
+    benchmark_duration,
+    tokenizer,
+    selected_percentile_metrics,
+    selected_percentiles,
+    gootput_config_dict,
+    print_stable_throughput: bool = False,
+    sample_range: Optional[Tuple[float, float]] = None,
+):
+    input_requests = input_requests.copy()
+    outputs = outputs.copy()
+
+    if sample_range:
+        start_idx = int(sample_range[0] * len(outputs))
+        end_idx = int(sample_range[1] * len(outputs))
+        input_requests = input_requests[start_idx:end_idx]
+        outputs = outputs[start_idx:end_idx]
+
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
@@ -549,22 +617,44 @@ async def benchmark(
         gootput_config_dict=gootput_config_dict,
     )
 
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    if gootput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
-    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                    metrics.total_token_throughput))
+    if sample_range is None:
+        print("{s:{c}^{n}}".format(s=" Full Serving Benchmark Result ", n=50, c="="))
+        print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+        print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+        print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request throughput (req/s):", metrics.request_throughput
+            )
+        )
+        if gootput_config_dict:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Request goodput (req/s):", metrics.request_goodput
+                )
+            )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", metrics.output_throughput
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total Token throughput (tok/s):", metrics.total_token_throughput
+            )
+        )
+        if print_stable_throughput:
+            from evaluation.plots.dataset_performance.parse_performance_metrics import get_stable_throughput
+            stable_output_throughput = get_stable_throughput("decode.out")
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Stable Output Token throughput (tok/s):",
+                    stable_output_throughput * 1000,
+                )
+            )
+    else:
+        print("{s:{c}^{n}}".format(s=" Steady Serving Benchmark Result ", n=50, c="="))
 
     result = {
         "duration": benchmark_duration,
@@ -572,8 +662,7 @@ async def benchmark(
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
-        "request_goodput:":
-        metrics.request_goodput if gootput_config_dict else None,
+        "request_goodput:": metrics.request_goodput if gootput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
@@ -596,34 +685,39 @@ async def benchmark(
         # metric.
         if metric_attribute_name not in selected_percentile_metrics:
             return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
+        print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Mean {metric_name} (ms):",
+                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Median {metric_name} (ms):",
+                getattr(metrics, f"median_{metric_attribute_name}_ms"),
+            )
+        )
         result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
+            metrics, f"mean_{metric_attribute_name}_ms"
+        )
         result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
+            metrics, f"median_{metric_attribute_name}_ms"
+        )
         result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
+            metrics, f"std_{metric_attribute_name}_ms"
+        )
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
+            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
             result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT",
-                       "Time per Output Token (excl. 1st token)")
+    process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
     print("=" * 50)
-
     return result
 
 
@@ -662,10 +756,14 @@ def parse_goodput(slo_pairs):
     return gootput_config_dict
 
 
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+
+
 def main(args: argparse.Namespace):
     print(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    set_random_seed(args.seed)
 
     backend = args.backend
     model_id = args.model
@@ -753,10 +851,15 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
         )
 
+    elif args.dataset_name == "custom-dataset":
+        input_requests = sample_dataset_requests(
+            args.dataset_path, args.num_prompts
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
     gootput_config_dict = check_goodput_args(args)
+    set_random_seed(args.seed)
 
     benchmark_result = asyncio.run(
         benchmark(
@@ -772,13 +875,18 @@ def main(args: argparse.Namespace):
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
             selected_percentile_metrics=args.percentile_metrics.split(","),
-            selected_percentiles=[
-                float(p) for p in args.metric_percentiles.split(",")
-            ],
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
             ignore_eos=args.ignore_eos,
             gootput_config_dict=gootput_config_dict,
             max_concurrency=args.max_concurrency,
-        ))
+            print_stable_throughput=args.stable_throughput,
+            sample_range=(
+                (args.sample_start, args.sample_end)
+                if args.sample_start is not None and args.sample_end is not None
+                else None
+            ),
+        )
+    )
 
     # Save config and results to json
     if args.save_result:
@@ -859,7 +967,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "sonnet", "random", "hf", "custom-dataset"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1004,6 +1112,18 @@ if __name__ == "__main__":
         "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
+
+    parser.add_argument("--stable-throughput", action="store_true")
+    parser.add_argument(
+        "--sample-start",
+        type=float,
+        help="The percentile to use for the steady state start. ",
+    )
+    parser.add_argument(
+        "--sample-end",
+        type=float,
+        help="The percentile to use for the steady state end. ",
+    )
 
     # group for dataset specific arguments
     sonnet_group = parser.add_argument_group("sonnet dataset options")

@@ -374,7 +374,7 @@ class SequenceData(msgspec.Struct,
                 f"prompt_token_ids={self._prompt_token_ids}, "
                 f"output_token_ids={self.output_token_ids}, "
                 f"cumulative_logprob={self.cumulative_logprob}, "
-                f"get_num_computed_tokens={self.get_num_computed_tokens()}")
+                f"get_num_computed_tokens={self.get_num_computed_tokens()})")
 
 
 class Sequence:
@@ -847,11 +847,33 @@ class SequenceGroup:
     def num_finished_seqs(self) -> int:
         return 1 if self.first_seq.is_finished() else 0
 
+    def get_num_blocks(self, status: Optional[SequenceStatus] = None):
+        return sum(seq.n_blocks for seq in self.get_seqs(status))
+
+    def get_seq_lens(self, status: Optional[SequenceStatus] = None):
+        return sum(seq.get_len() for seq in self.get_seqs(status))
+
     def is_finished(self) -> bool:
         return self.first_seq.is_finished()
 
     def is_prefill(self) -> bool:
         return self.first_seq.is_prefill()
+
+    @property
+    def max_tokens(self):
+        return self.sampling_params.max_tokens
+
+    @property
+    def is_offload(self):
+        return self.sampling_params.offload
+
+    @property
+    def is_recv_fin(self):
+        return self.sampling_params.is_recv_fin
+
+    @property
+    def prefill_rank(self):
+        return self.sampling_params.prefill_rank
 
     def __repr__(self) -> str:
         return (f"SequenceGroup(request_id={self.request_id}, "
@@ -996,6 +1018,10 @@ class SequenceGroupMetadata(
         assert self.state.current_step < self.state.num_steps, \
             f"current step {self.state.current_step}, num_steps {self.state.num_steps}" # noqa
         self.state.current_step += 1
+
+    @property
+    def num_blocks(self):
+        return sum(len(blocks) for blocks in self.block_tables.values())
 
 
 class SequenceOutput(
