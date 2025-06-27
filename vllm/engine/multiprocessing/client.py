@@ -15,7 +15,9 @@ from zmq.asyncio import Socket
 from vllm import PoolingParams
 from vllm.config import DecodingConfig, ModelConfig, VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.multiprocessing import RecvOffloadRequestFlag
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.engine.async_llm_engine import (
@@ -190,13 +192,13 @@ class MQLLMEngineClient(EngineClient):
                         return
 
                 message: Frame = await self.output_socket.recv(copy=False)
-                request_outputs = pickle.loads(message.buffer)
+                output_from_engine = pickle.loads(message.buffer)
 
-                is_error = isinstance(request_outputs,
+                is_error = isinstance(output_from_engine,
                                       (BaseException, RPCError))
                 if is_error:
-                    if isinstance(request_outputs, RPCError):
-                        rpc_error: RPCError = request_outputs
+                    if isinstance(output_from_engine, RPCError):
+                        rpc_error: RPCError = output_from_engine
                         request_id = rpc_error.request_id
                         exception = rpc_error.exception
                         is_engine_errored = rpc_error.is_engine_errored
@@ -205,7 +207,7 @@ class MQLLMEngineClient(EngineClient):
                         # the output_socket when an issue arises.
                         # If we are here, we are in a bad state and
                         # should shut down the server.
-                        error: BaseException = request_outputs
+                        error: BaseException = output_from_engine
                         logger.error(
                             "Received Exception %s rather than RPCError from "
                             "MPLLMEngine. This should never happen.", error)
@@ -237,7 +239,13 @@ class MQLLMEngineClient(EngineClient):
                         queue = self.output_queues.get(request_id)
                         if queue is not None:
                             queue.put_nowait(exception)
+                elif isinstance(output_from_engine, RecvOffloadRequestFlag):
+                    offload_flag = output_from_engine
+                    queue = self.output_queues.get(offload_flag.request_id)
+                    assert queue is not None
+                    queue.put_nowait(offload_flag)
                 else:
+                    request_outputs = output_from_engine
                     # Put each output into the appropriate steam.
                     for request_output in request_outputs:
                         queue = self.output_queues.get(
@@ -450,7 +458,7 @@ class MQLLMEngineClient(EngineClient):
         priority: int = 0,
         *,
         inputs: Optional[PromptType] = None  # DEPRECATED
-    ) -> AsyncGenerator[RequestOutput, None]:
+    ) -> AsyncGenerator[Union[RequestOutput, RecvOffloadRequestFlag], None]:
         """Generate outputs for a request.
 
         Generate outputs for a request. This method is a coroutine. It adds the
@@ -560,7 +568,7 @@ class MQLLMEngineClient(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
-    ) -> Union[AsyncGenerator[RequestOutput, None], AsyncGenerator[
+    ) -> Union[AsyncGenerator[Union[RequestOutput, RecvOffloadRequestFlag], None], AsyncGenerator[
             EmbeddingRequestOutput, None]]:
         """Send an RPCGenerateRequest to the RPCServer and stream responses."""
 
@@ -583,8 +591,7 @@ class MQLLMEngineClient(EngineClient):
                 )
 
         # 1) Create output queue for this requests.
-        queue: asyncio.Queue[Union[RequestOutput,
-                                   BaseException]] = asyncio.Queue()
+        queue: asyncio.Queue[Union[RequestOutput, BaseException, RecvOffloadRequestFlag]] = asyncio.Queue()
         self.output_queues[request_id] = queue
 
         try:
@@ -625,6 +632,10 @@ class MQLLMEngineClient(EngineClient):
 
                     if isinstance(request_output, BaseException):
                         raise request_output
+
+                    if isinstance(request_output, RecvOffloadRequestFlag):
+                        yield request_output
+                        continue
 
                     finished = request_output.finished
                     yield request_output

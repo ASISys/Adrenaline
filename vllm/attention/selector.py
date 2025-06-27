@@ -27,6 +27,7 @@ class _Backend(enum.Enum):
     PALLAS = enum.auto()
     IPEX = enum.auto()
     NO_ATTENTION = enum.auto()
+    ADRENALINE_FLASHINFER = enum.auto()
 
 
 def backend_name_to_enum(backend_name: str) -> _Backend:
@@ -182,6 +183,10 @@ def _cached_get_attn_backend(
         from vllm.attention.backends.placeholder_attn import (
             PlaceholderAttentionBackend)
         return PlaceholderAttentionBackend
+    elif backend == _Backend.ADRENALINE_FLASHINFER:
+        logger.info("Using Adrenaline_Flashinfer Backends")
+        from adrenaline.attention.backends.flashinfer import AdrenalineFlashInferBackend
+        return AdrenalineFlashInferBackend
     else:
         raise ValueError("Invalid attention backend.")
 

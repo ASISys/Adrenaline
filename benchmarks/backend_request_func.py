@@ -271,7 +271,9 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # FIXME: Using the dummy weight for testing performance,
+                            # we are ignoring generated text
+                            if data["choices"][0]["text"] or True:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:

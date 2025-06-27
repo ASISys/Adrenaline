@@ -10,13 +10,16 @@ from typing import Set, Tuple, Union
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
+from vllm.distributed.parallel_state import get_disagg_group, get_offload_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
-from vllm.utils import Device, PyObjectCache
+from vllm.utils import Device, PyObjectCache, cdiv
+from adrenaline.utils.utils import get_offload_ratio
 
 logger = init_logger(__name__)
 
@@ -268,6 +271,18 @@ class SchedulerPrefillOutputs:
             num_lookahead_slots=0,
         )
 
+@dataclass
+class SchedulerOffloadedOutputs:
+    # Selected sequences that are running and in a decoding phase.
+    decode_seq_groups: List[ScheduledSequenceGroup]
+    decode_seq_groups_list: List[SequenceGroup]
+    
+    @classmethod
+    def create_empty(cls) -> "SchedulerOffloadedOutputs":
+        return SchedulerOffloadedOutputs(
+            decode_seq_groups=[],
+            decode_seq_groups_list=[],
+        )
 
 def seq_group_metadata_builder():
     return SequenceGroupMetadata(request_id="",
@@ -339,12 +354,18 @@ class Scheduler:
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
         self.waiting: Deque[SequenceGroup] = deque()
+        # Sequence groups in the RECVING state.
+        # Contain prefill requests which async recving kvcache.
+        self.recving: Deque[SequenceGroup] = deque()
         # Sequence groups in the RUNNING state.
         # Contain decode requests.
         self.running: Deque[SequenceGroup] = deque()
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
+        # Sequence groups in the RUNNING and offloaded state.
+        # Contain decode requests that are offloaded.
+        self.offloaded: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -358,6 +379,9 @@ class Scheduler:
         self.last_prompt_latency = 0.0
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
+
+        # offload_ratio used for setting offload attention workload
+        self.offload_ratio = get_offload_ratio() if dist_kv.ENABLE_KV_OFFLOAD else None
 
         # The following field is test-only. It is used to inject artificial
         # preemption.
@@ -474,8 +498,13 @@ class Scheduler:
             self.block_manager.free_cross(seq_group)
 
     def has_unfinished_seqs(self) -> bool:
-        return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0
+        return (
+            len(self.waiting) != 0
+            or len(self.recving) != 0
+            or len(self.running) != 0
+            or len(self.swapped) != 0
+            or len(self.offloaded) != 0
+        )
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
@@ -752,6 +781,54 @@ class Scheduler:
             infeasible_seq_groups=infeasible_seq_groups,
         )
 
+    def _schedule_offloaded(
+        self,
+        budget: SchedulingBudget,
+        running_scheduled: SchedulerRunningOutputs,
+        curr_loras: Optional[set[int]] = None,
+        enable_chunking: bool = False,
+    ):
+        local_block_len = sum([
+            seq_group.get_num_blocks(SequenceStatus.RUNNING)
+            for seq_group in running_scheduled.decode_seq_groups_list
+        ])
+
+        offload_block_len = 0
+        decode_seq_groups: list[ScheduledSequenceGroup] = []
+        decode_seq_groups_list: list[SequenceGroup] = []
+        offloaded_queue = self.offloaded
+        leftover_offloaded: deque[SequenceGroup] = deque()
+        while offloaded_queue:
+            seq_group = offloaded_queue[0]
+            num_running_tokens = self._get_num_new_tokens(
+                seq_group, SequenceStatus.RUNNING, enable_chunking, budget
+            )
+            if num_running_tokens == 0:
+                break
+            offloaded_queue.popleft()
+            if (
+                self.use_async_output_proc
+                and seq_group.seqs[0].get_len() > self.scheduler_config.max_model_len
+            ):
+                self._async_stopped.append(seq_group)
+                continue
+            assert not seq_group.is_prefill()
+
+            req_group_block_len = seq_group.get_num_blocks(SequenceStatus.RUNNING)
+            scheduled_seq_group = ScheduledSequenceGroup(seq_group, num_running_tokens)
+            decode_seq_groups.append(scheduled_seq_group)
+            decode_seq_groups_list.append(seq_group)
+            budget.add_num_batched_tokens(seq_group.request_id, num_running_tokens)
+            offload_block_len += req_group_block_len
+            if enable_chunking:
+                num_running_seqs = seq_group.get_max_num_running_seqs()
+                budget.add_num_seqs(seq_group.request_id, num_running_seqs)
+            if curr_loras is not None and seq_group.lora_int_id > 0:
+                curr_loras.add(seq_group.lora_int_id)
+
+        offloaded_queue.extendleft(leftover_offloaded)
+        return SchedulerOffloadedOutputs(decode_seq_groups, decode_seq_groups_list)
+
     def _get_prompt_limit(self, seq_group: SequenceGroup) -> int:
         if self.scheduler_config.chunked_prefill_enabled and \
                 not self.scheduler_config.is_multi_step:
@@ -807,17 +884,17 @@ class Scheduler:
                                                       SequenceStatus.WAITING,
                                                       False, budget)
 
-            #Only preempt if priority inversion exists
+            # Only preempt if priority inversion exists
             while running_queue and self._get_priority(
                     running_queue[-1]) > self._get_priority(seq_group):
-                #Only preempt if waiting sequence cannot be allocated
+                # Only preempt if waiting sequence cannot be allocated
                 can_allocate = self.block_manager.can_allocate(seq_group)
                 if (num_new_tokens and can_allocate == AllocStatus.OK
                         and budget.can_schedule(num_new_tokens=num_new_tokens,
                                                 num_new_seqs=num_new_seqs)):
                     break
 
-                #Adjust budget to remove the victim sequence group
+                # Adjust budget to remove the victim sequence group
                 vseq_group = running_queue.pop()
                 num_running_tokens = self._get_num_new_tokens(
                     vseq_group, SequenceStatus.RUNNING, False, budget)
@@ -827,11 +904,11 @@ class Scheduler:
                 budget.subtract_num_seqs(vseq_group.request_id,
                                          num_running_seqs)
 
-                #Preempt out the victim sequence group
+                # Preempt out the victim sequence group
                 self._preempt(vseq_group, blocks_to_swap_out)
                 waiting_queue.appendleft(vseq_group)
                 force_preemption_count += 1
-            #Put the sequence back into the waiting queue
+            # Put the sequence back into the waiting queue
             waiting_queue.appendleft(seq_group)
 
         waiting_queue = deque(sorted(waiting_queue, key=self._get_priority))
@@ -839,6 +916,68 @@ class Scheduler:
         self.waiting = waiting_queue
         self.running = running_queue
         return force_preemption_count
+
+    def _schedule_recving(self) -> Tuple[SchedulerPrefillOutputs, int]:
+        """Schedule sequence group that are recving"""
+
+        ignored_seq_groups: List[SequenceGroup] = []
+        seq_groups: List[ScheduledSequenceGroup] = []
+
+        recving_queue = self.recving
+        num_batched_tokens = 0
+
+        leftover_recving_sequences: Deque[SequenceGroup] = deque()
+        for seq_group in recving_queue:
+            if get_disagg_group().query_recv_finished(seq_group.request_id):
+                seq_group.sampling_params.is_recv_fin = True
+                num_new_tokens = seq_group.seqs[0].get_len()
+                seq_groups.append(
+                    ScheduledSequenceGroup(
+                        seq_group=seq_group, token_chunk_size=num_new_tokens
+                    )
+                )
+                num_batched_tokens += num_new_tokens
+            else:
+                leftover_recving_sequences.append(seq_group)
+
+        self.recving = leftover_recving_sequences
+        if seq_groups:
+            self.prev_prompt = True
+
+        scheduled_ready = SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=ignored_seq_groups,
+            num_lookahead_slots=0,
+        )
+        return scheduled_ready, num_batched_tokens
+
+    def _schedule_recv_ready(self) -> Optional[SchedulerOutputs]:
+        """Schedule sequence groups that finished recving (ready to decode)"""
+        assert dist_kv.IS_KV_CONSUMER
+        scheduled_ready, num_batched_token = self._schedule_recving()
+        if len(scheduled_ready.seq_groups) == 0:
+            return None
+
+        self.running.extend([
+            s.seq_group for s in scheduled_ready.seq_groups
+            if not s.seq_group.is_offload
+        ])
+        self.offloaded.extend([
+            s.seq_group for s in scheduled_ready.seq_groups
+            if s.seq_group.is_offload
+        ])
+        return SchedulerOutputs(
+            scheduled_seq_groups=scheduled_ready.seq_groups,
+            num_prefill_groups=len(scheduled_ready.seq_groups),
+            num_batched_tokens=num_batched_token,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=scheduled_ready.ignored_seq_groups,
+            num_lookahead_slots=scheduled_ready.num_lookahead_slots,
+            running_queue_size=len(self.running),
+            preempted=0,
+        )
 
     def _schedule_prefills(
         self,
@@ -875,6 +1014,13 @@ class Scheduler:
         waiting_queue = self.waiting
 
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+        # TODO: fix for multi-instance
+        attn_running_blocks = sum([
+            seq_group.get_num_blocks(SequenceStatus.RUNNING)
+            for seq_group in self.offloaded
+        ])
+        has_local_skip = False
+        has_attn_skip = False
         while self._passed_delay(time.time()) and waiting_queue:
             seq_group = waiting_queue[0]
 
@@ -906,10 +1052,37 @@ class Scheduler:
                     True, enable_chunking)
 
             # If the sequence group cannot be allocated, stop.
-            can_allocate = self.block_manager.can_allocate(
-                seq_group, num_lookahead_slots=num_lookahead_slots)
+            if seq_group.is_offload and dist_kv.IS_KV_CONSUMER:
+                # TODO: refact manager attn instance blocks by attn_block_manager
+                num_attn_total_blocks = int(self.cache_config.num_gpu_blocks * self.offload_ratio)
+                req_max_tokens = seq_group.max_tokens if seq_group.max_tokens is not None else self.scheduler_config.max_model_len
+                req_max_blocks = cdiv(req_max_tokens, self.block_manager.block_size)
+                num_attn_max_total_blocks = float(os.getenv("VLLM_ATTN_MAX_TOTAL_BLOCKS", "inf"))
+                if req_max_blocks > num_attn_max_total_blocks:
+                    can_allocate = AllocStatus.NEVER
+                if attn_running_blocks >= num_attn_total_blocks * dist_kv.NUM_ATTN_INSTANCES:
+                    can_allocate = AllocStatus.LATER
+                else:
+                    can_allocate = AllocStatus.OK
+            else:
+                can_allocate = self.block_manager.can_allocate(
+                    seq_group, num_lookahead_slots=num_lookahead_slots)
             if can_allocate == AllocStatus.LATER:
-                break
+                if not dist_kv.ENABLE_KV_OFFLOAD:
+                    break
+                if dist_kv.IS_KV_PRODUCER:
+                    break
+                assert dist_kv.IS_KV_CONSUMER
+                if has_local_skip and has_attn_skip:
+                    break
+                if seq_group.is_offload:
+                    has_attn_skip = True
+                else:
+                    has_local_skip = True
+                leftover_waiting_sequences.appendleft(seq_group)
+                waiting_queue.popleft()
+                continue
+
             elif can_allocate == AllocStatus.NEVER:
                 logger.warning(
                     "Input prompt (%d tokens) + lookahead slots (%d) is "
@@ -997,21 +1170,29 @@ class Scheduler:
         # Make sure we include num running seqs before scheduling prefill,
         # so that we don't schedule beyond max_num_seqs for prefill.
         for seq_group in self.running:
-            budget.add_num_seqs(seq_group.request_id,
-                                seq_group.get_max_num_running_seqs())
+            budget.add_num_seqs(
+                seq_group.request_id, seq_group.get_max_num_running_seqs()
+            )
+        for seq_group in self.offloaded:
+            budget.add_num_seqs(
+                seq_group.request_id, seq_group.get_max_num_running_seqs()
+            )
         curr_loras = set(
             seq_group.lora_int_id for seq_group in self.running
             if seq_group.lora_int_id > 0) if self.lora_enabled else None
 
         prefills = SchedulerPrefillOutputs.create_empty()
         running_scheduled = SchedulerRunningOutputs.create_empty()
+        offloaded_scheduled = SchedulerOffloadedOutputs.create_empty()
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
+            prefills = self._schedule_prefills(
+                budget,
+                curr_loras,
+                enable_chunking=False,
+            )
 
         if len(prefills.seq_groups
                ) == 0 and self.scheduler_config.policy == "priority":
@@ -1031,17 +1212,38 @@ class Scheduler:
                     running_scheduled.swapped_out) == 0:
                 swapped_in = self._schedule_swapped(budget, curr_loras)
 
+            offloaded_scheduled = self._schedule_offloaded(
+                budget,
+                running_scheduled,
+                curr_loras,
+                enable_chunking=False,
+            )
+
         assert (budget.num_batched_tokens <=
                 self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
+        if dist_kv.IS_DISTRIBUTED_KV_INSTANCE and dist_kv.IS_KV_CONSUMER:
+            assert len(running_scheduled.preempted) == 0, f"Use SWAP PreemptionMode in PD-disaggation"
         self.waiting.extendleft(running_scheduled.preempted)
-        # Update new running requests.
+
+        # Update recving, running and offloaded requests.
         if len(prefills.seq_groups) > 0:
-            self.running.extend([s.seq_group for s in prefills.seq_groups])
+            if dist_kv.IS_KV_CONSUMER:
+                self.recving.extend([s.seq_group for s in prefills.seq_groups])
+                # update running and offloaded request in prefill ready iteration
+                # i.e. the return value of `self._schedule_recv_fin` is not None
+            else:
+                self.running.extend(
+                    [s.seq_group for s in prefills.seq_groups if not s.seq_group.is_offload]
+                )
+                self.offloaded.extend(
+                    [s.seq_group for s in prefills.seq_groups if s.seq_group.is_offload]
+                )
 
         self.running.extend(running_scheduled.decode_seq_groups_list)
+        self.offloaded.extend(offloaded_scheduled.decode_seq_groups_list)
 
         if len(swapped_in.decode_seq_groups) > 0:
             self.running.extend(
@@ -1064,6 +1266,7 @@ class Scheduler:
             scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
         else:
             scheduled_seq_groups = running_scheduled.decode_seq_groups
+            scheduled_seq_groups.extend(offloaded_scheduled.decode_seq_groups)
         scheduled_seq_groups.extend(swapped_in.decode_seq_groups)
 
         blocks_to_copy = running_scheduled.blocks_to_copy
@@ -1170,7 +1373,11 @@ class Scheduler:
         )
 
     def _schedule(self) -> SchedulerOutputs:
-        """Schedule queued requests."""
+        if dist_kv.IS_KV_CONSUMER:
+            recv_fin_output = self._schedule_recv_ready()
+            if recv_fin_output is not None:
+                return recv_fin_output
+
         if self.scheduler_config.chunked_prefill_enabled:
             return self._schedule_chunked_prefill()
         else:
@@ -1207,6 +1414,143 @@ class Scheduler:
             seq_group.sampling_params.n == 1)
         return no_single_seq
 
+    def _allocate_prefills_for_attn_instance(self, scheduled_request_ids: list[str]):
+        seq_groups: list[ScheduledSequenceGroup] = []
+        num_batched_tokens = 0
+        waiting_seq_groups = {sg.request_id: sg for sg in self.waiting}
+        for request_id in scheduled_request_ids:
+            seq_group = waiting_seq_groups.pop(request_id)
+            num_new_tokens = seq_group.get_seqs(SequenceStatus.WAITING)[0].get_len()
+            num_batched_tokens += num_new_tokens
+            can_allocate = self.block_manager.can_allocate(seq_group)
+            assert can_allocate == AllocStatus.OK, "Not enough blocks to allocate for attn instance"
+            self._allocate_and_set_running(seq_group)
+            scheduled_seq_group = ScheduledSequenceGroup(
+                seq_group=seq_group, token_chunk_size=num_new_tokens
+            )
+            seq_groups.append(scheduled_seq_group)
+        self.waiting = deque(waiting_seq_groups.values())
+        return SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=[],
+            num_lookahead_slots=0,
+        ), num_batched_tokens
+
+    def _allocate_running_for_attn_instance(self, scheduled_request_ids: list[str]) -> SchedulerRunningOutputs:
+        assert dist_kv.IS_ATTN_EXECUTOR
+        scheduled_decode_seq_groups: list[ScheduledSequenceGroup] = []
+        decode_seq_groups_list: list[SequenceGroup] = []
+        running_seq_groups = {sg.request_id: sg for sg in self.running}
+        for request_id in scheduled_request_ids:
+            seq_group = running_seq_groups.pop(request_id)
+            if seq_group.prefill_rank == dist_kv.get_attn_rank():
+                assert self._can_append_slots(seq_group, enable_chunking=False), "Not support preemption in attn instance"
+                self._append_slots(seq_group, [], enable_chunking=False)
+            scheduled_seq_group = ScheduledSequenceGroup(
+                seq_group=seq_group, token_chunk_size=1
+            )
+            scheduled_decode_seq_groups.append(scheduled_seq_group)
+            decode_seq_groups_list.append(seq_group)
+        self.running = deque(running_seq_groups.values())
+        return SchedulerRunningOutputs(
+            decode_seq_groups=scheduled_decode_seq_groups,
+            prefill_seq_groups=[],
+            preempted=[],
+            swapped_out=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            num_lookahead_slots=0,
+            decode_seq_groups_list=decode_seq_groups_list,
+            prefill_seq_groups_list=[],
+        )
+
+    def _schedule_recving_for_attn_instance(self, scheduled_request_ids: list[str]):
+        seq_groups: list[ScheduledSequenceGroup] = []
+        num_batched_token = 0
+        recving_seq_groups = {sg.request_id: sg for sg in self.recving}
+        for request_id in scheduled_request_ids:
+            seq_group = recving_seq_groups.pop(request_id)
+            # FIXME: query_recv_finished with blocking
+            # assert get_offload_kv_group().query_recv_finished(seq_group.request_id)
+            seq_group.sampling_params.is_recv_fin = True
+            num_new_tokens = seq_group.seqs[0].get_len()
+            sched_seq_group = ScheduledSequenceGroup(
+                seq_group=seq_group, token_chunk_size=num_new_tokens
+            )
+            seq_groups.append(sched_seq_group)
+            num_batched_token += num_new_tokens
+        self.recving = deque(recving_seq_groups.values())
+        if seq_groups:
+            self.prev_prompt = True
+        scheduled_ready = SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=[],
+            num_lookahead_slots=0,
+        )
+        return scheduled_ready, num_batched_token
+
+    def _schedule_recv_ready_for_attn_instance(self, request_ids: list[str]):
+        assert dist_kv.IS_ATTN_EXECUTOR
+        scheduled_ready, num_batched_token = self._schedule_recving_for_attn_instance(
+            request_ids
+        )
+        assert len(scheduled_ready.seq_groups) > 0
+        self.running.extend([s.seq_group for s in scheduled_ready.seq_groups])
+        return SchedulerOutputs(
+            scheduled_seq_groups=scheduled_ready.seq_groups,
+            num_prefill_groups=len(scheduled_ready.seq_groups),
+            num_batched_tokens=num_batched_token,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=[],
+            num_lookahead_slots=scheduled_ready.num_lookahead_slots,
+            running_queue_size=len(self.running),
+            preempted=0,
+        )
+
+    def _allocate_blocks_for_attn_instance(self, scheduled_request_ids: list[str], is_prefill: bool):
+        prefills = SchedulerPrefillOutputs.create_empty()
+        running_scheduled = SchedulerRunningOutputs.create_empty()
+        if is_prefill:
+            prefills, num_batched_token = self._allocate_prefills_for_attn_instance(
+                scheduled_request_ids
+            )
+        else:
+            running_scheduled = self._allocate_running_for_attn_instance(
+                scheduled_request_ids
+            )
+            num_batched_token = len(scheduled_request_ids)
+
+        self.waiting.extendleft(running_scheduled.preempted)
+        # Update new running requests.
+        if len(prefills.seq_groups) > 0:
+            self.recving.extend([s.seq_group for s in prefills.seq_groups])
+
+        self.running.extend(running_scheduled.decode_seq_groups_list)
+
+        assert len(running_scheduled.prefill_seq_groups) == 0
+        # assert len(swapped_in.prefill_seq_groups) == 0
+
+        num_prefill_groups = len(prefills.seq_groups)
+        if num_prefill_groups > 0:
+            scheduled_seq_groups = prefills.seq_groups
+            scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
+        else:
+            scheduled_seq_groups = running_scheduled.decode_seq_groups
+        return SchedulerOutputs(
+            scheduled_seq_groups=scheduled_seq_groups,
+            num_prefill_groups=num_prefill_groups,
+            num_batched_tokens=num_batched_token,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=[],
+            num_lookahead_slots=0,
+            running_queue_size=len(self.running),
+            preempted=0,
+        )
+
     def schedule(
             self
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
@@ -1215,7 +1559,44 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
-        scheduler_outputs: SchedulerOutputs = self._schedule()
+        # TODO: add record queue info flags
+        logger.debug(f"{len(self.waiting)=}, {len(self.recving)=}, "
+                     f"{len(self.running)=}, {len(self.offloaded)=}, "
+                     f"{len(self.swapped)=}")
+        logger.debug(f"{[sg.request_id for sg in self.waiting]=}")
+        logger.debug(f"{[sg.request_id for sg in self.recving]=}")
+        logger.debug(f"{[sg.request_id for sg in self.running]=}")
+        logger.debug(f"{[sg.request_id for sg in self.offloaded]=}")
+        if not dist_kv.ENABLE_KV_OFFLOAD:
+            scheduler_outputs = self._schedule()
+        else:
+            if dist_kv.IS_KV_CONSUMER:
+                scheduler_outputs = self._schedule()
+                attn_sche_outputs, has_offload = make_attn_scheduler_outputs(scheduler_outputs)
+                if has_offload:
+                    request_ids = [s.seq_group.request_id for s in attn_sche_outputs.scheduled_seq_groups]
+                    is_prefill = attn_sche_outputs.scheduled_seq_groups[0].seq_group.is_prefill()
+                    is_recv_fin = is_recv_fin_scheduler_outputs(attn_sche_outputs)
+                    get_offload_group().boardcast_sche_out([request_ids, is_prefill, is_recv_fin])
+            elif dist_kv.IS_ATTN_EXECUTOR:
+                recv_objects = [None, None, None]
+                recv_objects = get_offload_group().boardcast_sche_out(recv_objects)
+                request_ids, is_prefill, is_recv_fin = recv_objects[0], recv_objects[1], recv_objects[2]
+                if is_recv_fin:
+                    scheduler_outputs = self._schedule_recv_ready_for_attn_instance(
+                        request_ids
+                    )
+                else:
+                    scheduler_outputs = self._allocate_blocks_for_attn_instance(
+                        request_ids, is_prefill
+                    )
+            else:
+                assert dist_kv.IS_KV_PRODUCER
+                scheduler_outputs = self._schedule()
+        if len(scheduler_outputs.scheduled_seq_groups) == 0:
+            time.sleep(0)
+
+        logger.debug(f"{[sg.seq_group.request_id for sg in scheduler_outputs.scheduled_seq_groups]=}")
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1257,6 +1638,10 @@ class Scheduler:
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
+                if (seq_group.is_offload and dist_kv.IS_KV_CONSUMER) or (
+                    dist_kv.IS_ATTN_EXECUTOR and seq_group.prefill_rank != dist_kv.get_attn_rank()
+                ):
+                    continue
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
@@ -1398,6 +1783,14 @@ class Scheduler:
 
         self.running = remaining
 
+        remaining_offloaded: deque[SequenceGroup] = deque()
+        for seq_group in self.offloaded:
+            self._free_finished_seq_group(seq_group)
+            if not seq_group.is_finished():
+                remaining_offloaded.append(seq_group)
+
+        self.offloaded = remaining_offloaded
+
         # Handle async stopped sequence groups
         # (ones that reached max model len)
         if self._async_stopped:
@@ -1411,7 +1804,11 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
-        self.block_manager.allocate(seq_group)
+        skip_allocate = (seq_group.is_offload and dist_kv.IS_KV_CONSUMER) or (
+            dist_kv.IS_ATTN_EXECUTOR and seq_group.prefill_rank != dist_kv.get_attn_rank()
+        )
+        if not skip_allocate:
+            self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
 
@@ -1644,3 +2041,41 @@ class Scheduler:
             else:
                 num_new_tokens = min(num_new_tokens, remaining_token_budget)
         return num_new_tokens
+
+def make_attn_scheduler_outputs(scheduler_outputs: SchedulerOutputs):
+    offloaded_seq_groups: list[ScheduledSequenceGroup] = []
+    num_prefill_groups = 0
+    num_running_queue_size = 0
+    num_batched_tokens = 0
+
+    has_offload = False
+    for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+        if scheduled_seq_group.seq_group.is_offload:
+            offloaded_seq_groups.append(scheduled_seq_group)
+            num_batched_tokens += scheduled_seq_group.token_chunk_size
+            if scheduled_seq_group.seq_group.is_prefill():
+                num_prefill_groups += 1
+            else:
+                num_running_queue_size += 1
+            has_offload = True
+
+    attn_scheduler_outputs = SchedulerOutputs(
+        scheduled_seq_groups=offloaded_seq_groups,
+        num_prefill_groups=num_prefill_groups,
+        num_batched_tokens=num_batched_tokens,
+        blocks_to_swap_in=[],
+        blocks_to_swap_out=[],
+        blocks_to_copy=[],
+        ignored_seq_groups=[],
+        num_lookahead_slots=0,
+        running_queue_size=num_running_queue_size,
+        preempted=0
+    )
+    return attn_scheduler_outputs, has_offload
+
+def is_recv_fin_scheduler_outputs(scheduler_outputs: SchedulerOutputs):
+    has_prefill_requests = scheduler_outputs.num_prefill_groups > 0
+    seq_groups = scheduler_outputs.scheduled_seq_groups
+    is_recv_fin = any([sg.seq_group.is_recv_fin for sg in seq_groups])
+    assert all([sg.seq_group.is_recv_fin == is_recv_fin for sg in seq_groups])
+    return has_prefill_requests and is_recv_fin

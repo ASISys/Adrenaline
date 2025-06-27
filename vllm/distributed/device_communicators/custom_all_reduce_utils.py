@@ -219,7 +219,8 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         with tempfile.NamedTemporaryFile() as output_file:
             input_bytes = pickle.dumps(
                 (batch_src, batch_tgt, output_file.name))
-            returned = subprocess.run([sys.executable, __file__],
+            # FIXME: replace hardcode by parsing __file__ variable
+            returned = subprocess.run([sys.executable, "-m", "vllm.distributed.device_communicators.custom_all_reduce_utils"],
                                       input=input_bytes,
                                       capture_output=True)
             # check if the subprocess is successful

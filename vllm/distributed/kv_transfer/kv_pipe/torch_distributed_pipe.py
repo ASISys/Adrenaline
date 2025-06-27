@@ -79,6 +79,9 @@ class TorchDistributedPipe(KVPipeBase):
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
 
+        if self.device_group is None:
+            logger.debug(f"rank {self.rank} not in any group")
+            return
         assert self.device_group is not None
         assert self.rank_in_group <= 1
 
@@ -125,14 +128,13 @@ class TorchDistributedPipe(KVPipeBase):
         Returns:
             - metadata: the metadata tensor, on self.device
         """
-        buffer = torch.empty(self.METADATA_LENGTH,
-                             dtype=self.METADATA_DTYPE,
-                             device="cpu")
+        buffer = torch.empty(
+            self.METADATA_LENGTH, dtype=self.METADATA_DTYPE, device="cpu"
+        )
         buffer[0] = DTYPE2INT[tensor.dtype]
         ndims = len(tensor.shape)
         buffer[1] = len(tensor.shape)
-        buffer[2:2 + ndims] = torch.tensor(tensor.shape,
-                                           dtype=self.METADATA_DTYPE)
+        buffer[2 : 2 + ndims] = torch.tensor(tensor.shape, dtype=self.METADATA_DTYPE)
         return buffer.to(self.device)
 
     def _prepare_recv_buffer(self,
@@ -207,9 +209,9 @@ class TorchDistributedPipe(KVPipeBase):
         d_metadata = self._recv_metadata()
         buffer = self._prepare_recv_buffer(d_metadata)
 
-        torch.distributed.recv(buffer,
-                               src=self.target_rank_for_recv,
-                               group=self.device_group)
+        torch.distributed.recv(
+            buffer, src=self.target_rank_for_recv, group=self.device_group
+        )
 
         return buffer
 
@@ -287,3 +289,6 @@ class TorchDistributedPipe(KVPipeBase):
         if (hasattr(self, "transport_thread")
                 and self.transport_thread is not None):
             self.transport_thread.shutdown()
+
+        if self.device_group is not None:
+            torch.distributed.destroy_process_group(self.device_group)

@@ -34,6 +34,11 @@ class RequestLogger:
             if prompt_token_ids is not None:
                 prompt_token_ids = prompt_token_ids[:max_log_len]
 
+        # TODO: add disable log input flags
+        disable_log_input = True
+        if disable_log_input:
+            return
+
         logger.info(
             "Received request %s: prompt: %r, "
             "params: %s, prompt_token_ids: %s, "

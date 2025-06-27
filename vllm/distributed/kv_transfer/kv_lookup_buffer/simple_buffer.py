@@ -5,9 +5,11 @@ from typing import Deque, List, Optional, Union
 
 import torch
 
+from vllm.distributed.utils import TransferUtils, get_element_size
 from vllm.distributed.kv_transfer.kv_lookup_buffer.base import (
     KVLookupBufferBase)
 from vllm.distributed.kv_transfer.kv_pipe.base import KVPipeBase
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -15,8 +17,16 @@ logger = init_logger(__name__)
 
 class SimpleKVLookupBuffer(KVLookupBufferBase):
 
-    def __init__(self, signal_pipe: KVPipeBase, data_pipe: KVPipeBase,
-                 buffer_size_thresh: int):
+    def __init__(
+        self,
+        signal_pipe: KVPipeBase,
+        data_pipe: KVPipeBase,
+        buffer_size_thresh: int,
+        signal_pipes: Optional[list[KVPipeBase]] = None,
+        data_pipes: Optional[list[KVPipeBase]] = None,
+        send_stream: torch.cuda.Stream = None,
+        transfer_utils: Optional[TransferUtils] = None,
+    ):
         """
         signal_pipe: on CPU 
         
@@ -35,31 +45,30 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
         self.buffer_lock = threading.Lock()
         self.signal_pipe = signal_pipe
         self.data_pipe = data_pipe
+        self.data_pipes = data_pipes
+        self.signal_pipes = signal_pipes
         self.request_handling_thread: Optional[threading.Thread] = None
 
         self.normal_signal = torch.tensor([0])
         self.end_signal = None
+        self.send_stream = send_stream
+
+        self.hidden_size = transfer_utils.hidden_size
+        self.num_heads = transfer_utils.num_kv_heads
+        self.num_layers = transfer_utils.num_layers
+        self.head_size = transfer_utils.head_size
 
     def _matches(self, tokens_roi_sender: List[torch.Tensor],
                  tokens_roi_recver: List[torch.Tensor]):
 
-        # tokens_roi_sender: tokens and roi of the producer (in the buffer)
-        # tokens_roi_recver: tokens and roi of the consumer (query)
-
         tokens_sender = tokens_roi_sender[0]
         tokens_recver = tokens_roi_recver[0]
-        roi_sender = tokens_roi_sender[1]
-        roi_recver = tokens_roi_recver[1]
 
         if tokens_recver is None:
             # consumer sends an empty request
             # semantics: DROP SELECT * LIMIT 1
             # so any of the data in the buffer can be drop-selected
             return True
-
-        # Assuming that roi is a binary mask on tokens
-        tokens_sender = tokens_sender[roi_sender]
-        tokens_recver = tokens_recver[roi_recver]
 
         # simple common prefix matching
         min_length = min(len(tokens_sender), len(tokens_recver))
@@ -69,12 +78,6 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
 
         return 0
 
-    def _send_tensor_and_dec_size(self,
-                                  tensor: Optional[torch.Tensor]) -> None:
-
-        assert tensor is not None, "Use self.data_pipe.send(None) instead"
-        self.buffer_size -= tensor.element_size() * tensor.numel()
-        self.data_pipe.send_tensor(tensor)
 
     def _get_element_size(self, data: Optional[Union[List, torch.Tensor]]):
 
@@ -87,14 +90,12 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
 
         raise AssertionError("Unknown data type %s" % type(data))
 
-    def _add_to_buffer(self, input_tokens: torch.Tensor, roi: torch.Tensor,
+    def _add_to_buffer(self, input_tokens: torch.Tensor,
                        key: torch.Tensor, value: torch.Tensor,
                        hidden: torch.Tensor):
 
         if isinstance(input_tokens, torch.Tensor):
             input_tokens = input_tokens.clone()
-        if isinstance(roi, torch.Tensor):
-            roi = roi.clone()
         if isinstance(key, torch.Tensor):
             key = key.clone()
         if isinstance(value, torch.Tensor):
@@ -102,7 +103,7 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
         if isinstance(hidden, torch.Tensor):
             hidden = hidden.clone()
 
-        buffer_item = [input_tokens, roi, key, value, hidden]
+        buffer_item = [input_tokens, key, value, hidden]
 
         with self.buffer_lock:
             for data in buffer_item:
@@ -113,6 +114,10 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
         return signal is None
 
     def drop_select_handler(self):
+        with torch.cuda.stream(self.send_stream):
+            self.drop_select_handler_impl()
+
+    def drop_select_handler_impl(self):
 
         try:
 
@@ -124,8 +129,7 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
 
                 input_tokens = self.data_pipe.recv_tensor()
 
-                roi = self.data_pipe.recv_tensor()
-                tokens_roi_recver = [input_tokens, roi]
+                tokens_roi_recver = [input_tokens]
 
                 matched_length = 0
 
@@ -150,11 +154,13 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
                         # in case the tensor is freed before sending finishes
                         matched_item = self.buffer.popleft()
                         for tensor in matched_item:
-                            self._send_tensor_and_dec_size(tensor)
+                            self.buffer_size -= tensor.element_size() * tensor.numel()
+                            self.data_pipe.send_tensor(tensor)
 
                     else:
+                        raise ValueError("No match found in the buffer")
                         # no match, just send None
-                        for _ in range(5):
+                        for _ in range(4):
                             self.data_pipe.send_tensor(None)
 
         except RuntimeError as e:
@@ -164,37 +170,40 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
         logger.debug("Closing drop_select_handler")
 
     def drop_select(
-            self, input_tokens: Optional[torch.Tensor],
-            roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
+        self,
+        input_tokens: torch.Tensor,
+        recv_rank: int = -1,
+    ) -> List[Optional[torch.Tensor]]:
 
         assert self.request_handling_thread is None, \
             "drop_select should be called by the KV cache consumer "\
             "(e.g. the decode vLLM instance)"
 
-        if isinstance(input_tokens, torch.Tensor):
-            input_tokens = input_tokens.clone()
-        if isinstance(roi, torch.Tensor):
-            roi = roi.clone()
+        assert recv_rank != -1, "recv_rank should be specified"
+        self.signal_pipes[recv_rank].send_tensor(self.normal_signal)
+        self.data_pipes[recv_rank].send_tensor(input_tokens)
 
-        self.signal_pipe.send_tensor(self.normal_signal)
-        self.data_pipe.send_tensor(input_tokens)
-        self.data_pipe.send_tensor(roi)
+        input_tokens = self.data_pipes[recv_rank].recv_tensor()
+        key = self.data_pipes[recv_rank].recv_tensor()
+        value = self.data_pipes[recv_rank].recv_tensor()
+        hidden = self.data_pipes[recv_rank].recv_tensor()
 
-        input_tokens = self.data_pipe.recv_tensor()
-        roi = self.data_pipe.recv_tensor()
-        key = self.data_pipe.recv_tensor()
-        value = self.data_pipe.recv_tensor()
-        hidden = self.data_pipe.recv_tensor()
-
-        return [input_tokens, roi, key, value, hidden]
+        return [input_tokens, key, value, hidden]
 
     def full_handler(self):
         time.sleep(0.001)
 
-    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
-               key: torch.Tensor, value: torch.Tensor,
-               hidden: torch.Tensor) -> None:
+    def insert(
+        self,
+        input_tokens: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        hidden: torch.Tensor,
+        request_id: Optional[str] = None,
+    ) -> None:
 
+        if request_id is not None:
+            logger.debug(f"Inserting tensor to buffer {self.buffer_size=}, {request_id=}")
         if self.buffer_size > self.buffer_size_threshold:
             # log outside the while loop to avoid this message being logged
             # repeatedly.
@@ -202,7 +211,7 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
         while self.buffer_size > self.buffer_size_threshold:
             self.full_handler()
 
-        self._add_to_buffer(input_tokens, roi, key, value, hidden)
+        self._add_to_buffer(input_tokens, key, value, hidden)
 
         # when calling the insert, the current process is a sender
         # need to launch the request handler and start listening to request.
@@ -210,6 +219,12 @@ class SimpleKVLookupBuffer(KVLookupBufferBase):
             self.request_handling_thread = threading.Thread(
                 target=self.drop_select_handler)
             self.request_handling_thread.start()
+
+    def clear(self):
+        while len(self.buffer) > 0:
+            tensors = self.buffer.pop()
+            self.buffer_size -= sum((t.element_size() * t.numel() for t in tensors))
+
 
     def close(self):
 

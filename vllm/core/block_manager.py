@@ -10,12 +10,17 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 SeqId = int
 EncoderSeqId = str
 
+import os
+WATERMARK = float(os.environ["WATERMARK"]) if "WATERMARK" in os.environ else 0.05
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
     """BlockSpaceManager which manages the allocation of KV cache.
@@ -62,7 +67,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         block_size: int,
         num_gpu_blocks: int,
         num_cpu_blocks: int,
-        watermark: float = 0.01,
+        watermark: float = WATERMARK,
         sliding_window: Optional[int] = None,
         enable_caching: bool = False,
     ) -> None:
@@ -89,6 +94,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.enable_caching = enable_caching
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
+        logger.debug(f"init block_manager with {watermark=}, {self.watermark_blocks=}")
 
         self.block_allocator = CpuGpuBlockAllocator.create(
             allocator_type="prefix_caching" if enable_caching else "naive",
@@ -110,6 +116,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                      num_lookahead_slots: int = 0) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
+        if (seq_group.is_offload and dist_kv.IS_KV_CONSUMER) or (
+            dist_kv.IS_ATTN_EXECUTOR and seq_group.prefill_rank != dist_kv.get_attn_rank()
+        ):
+            return AllocStatus.OK
 
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
@@ -212,6 +222,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         for known tokens. The contents of the lookahead slots are not defined.
         This is used by speculative decoding when speculating future tokens.
         """
+
+        if (seq_group.is_offload and dist_kv.IS_KV_CONSUMER) or (
+            dist_kv.IS_ATTN_EXECUTOR and seq_group.prefill_rank != dist_kv.get_attn_rank()
+        ):
+            return True
 
         num_touched_blocks = 0
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):

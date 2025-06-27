@@ -5,6 +5,7 @@ import itertools
 import time
 import warnings
 import weakref
+import os
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, TypeVar, Union)
@@ -23,7 +24,7 @@ from vllm.compilation.compile_context import set_compile_context
 from vllm.compilation.levels import CompilationLevel
 from vllm.config import VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
-from vllm.distributed import get_disagg_group, get_pp_group
+from vllm.distributed import get_disagg_group, get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
@@ -74,7 +75,7 @@ _BATCH_SIZE_ALIGNMENT = 8
 # depending on the model's max_num_seqs.
 # NOTE: _get_graph_batch_size needs to be updated if this list is changed.
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
-    _BATCH_SIZE_ALIGNMENT * i for i in range(1, 1025)
+    _BATCH_SIZE_ALIGNMENT * i for i in range(1, 12)
 ]
 _NUM_WARMUP_ITERS = 2
 
@@ -109,6 +110,9 @@ class ModelInputForGPU(ModelRunnerInputBase):
     async_callback: Optional[Callable] = None
     seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None
     scheduler_outputs: Optional[SchedulerOutputs] = None
+    request_ids: Optional[List[str]] = None
+    prefill_ranks: Optional[list[int]] = None
+    is_recv_fins: Optional[list[bool]] = None
 
     def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
         tensor_dict = {
@@ -122,6 +126,9 @@ class ModelInputForGPU(ModelRunnerInputBase):
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
+            "prefill_ranks": self.prefill_ranks,
+            "is_recv_fins": self.is_recv_fins,
+            "request_ids": self.request_ids,
         }
         _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
         return tensor_dict
@@ -172,6 +179,11 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
+            "seq_lens": self.seq_lens,
+            "is_prompt": self.is_prompt,
+            "prefill_ranks": self.prefill_ranks,
+            "is_recv_fins": self.is_recv_fins,
+            "request_ids": self.request_ids,
         }
         _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
         _add_sampling_metadata_broadcastable_dict(tensor_dict,
@@ -263,6 +275,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             reinit: bool = False,
             reinit_use_defaults: bool = False,
             encoder_seq_len: int = 0,
+
+            # prefill rank used for multi-instance prefill
+            prefill_rank: int = -1,
+
+            # For async recv KV cache
+            is_recv_fin: bool = False,
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -277,6 +295,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
+            self.prefill_rank = prefill_rank
+            self.is_recv_fin = is_recv_fin
 
             if reinit:
                 if len(self.seq_ids) == 1 and reinit_use_defaults:
@@ -723,7 +743,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             computed_block_nums=seq_group_metadata.computed_block_nums,
             reinit=True,
             reinit_use_defaults=True,
-            encoder_seq_len=encoder_seq_len)
+            encoder_seq_len=encoder_seq_len,
+            prefill_rank=seq_group_metadata.sampling_params.prefill_rank,
+            is_recv_fin=seq_group_metadata.sampling_params.is_recv_fin,
+        )
 
         self.inter_data_list.append(inter_data)
 
@@ -738,11 +761,17 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                             decode_only: bool,
                             max_decode_seq_len: int,
                             max_encoder_seq_len: int = 0) -> bool:
-        return (decode_only and not self.runner.model_config.enforce_eager
-                and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
-                and max_decode_seq_len <= self.runner.max_seq_len_to_capture
-                and max_encoder_seq_len <= self.runner.max_seq_len_to_capture
-                and batch_size <= self.runner.max_batchsize_to_capture)
+        max_graph_batch = int(
+            os.environ.get("VLLM_MAX_GRAPH_BATCH", str(_BATCH_SIZES_TO_CAPTURE[-1]))
+        )
+        return (
+            decode_only
+            and not self.runner.model_config.enforce_eager
+            and batch_size <= max_graph_batch
+            and max_decode_seq_len <= self.runner.max_seq_len_to_capture
+            and max_encoder_seq_len <= self.runner.max_seq_len_to_capture
+            and batch_size <= self.runner.max_batchsize_to_capture
+        )
 
     def _get_cuda_graph_pad_size(self,
                                  num_seqs: int,
@@ -790,6 +819,694 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         graph_batch_size = _get_graph_batch_size(batch_size)
         assert graph_batch_size >= batch_size
         return graph_batch_size - batch_size
+
+    def build_model_input_for_prefill_with_offload(
+        self, num_locals: int, num_offloads: int
+    ):
+        return self.original_build_with_offload(num_locals, num_offloads)
+
+    def build_model_input_for_decode_with_offload(
+        self, num_locals: int, num_offloads: int
+    ) -> ModelInputForGPU:
+        assert dist_kv.IS_KV_CONSUMER
+        assert num_offloads > 0
+        # Combine and flatten intermediate data.
+        local_input_tokens: list[int] = []
+        # offload_input_tokens = []
+        offload_input_tokens: list[list[int]] = [
+            [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+        ]
+        for idx, inter_data in enumerate(self.inter_data_list):
+            if idx < num_locals:
+                for cur_input_tokens in inter_data.input_tokens:
+                    local_input_tokens.extend(cur_input_tokens)
+            else:
+                prefill_rank = inter_data.prefill_rank
+                for cur_input_tokens in inter_data.input_tokens:
+                    # offload_input_tokens.extend(cur_input_tokens)
+                    offload_input_tokens[prefill_rank].extend(cur_input_tokens)
+
+        if not local_input_tokens and not offload_input_tokens:
+            # This may happen when all prefill requests hit
+            # prefix caching and there is no decode request.
+            return self.model_input_cls()
+
+        mrope_input_positions: Optional[List[List[int]]] = None
+        if any(inter_data.mrope_input_positions is not None
+               for inter_data in self.inter_data_list):
+            mrope_input_positions = [[] for _ in range(3)]
+            for idx in range(3):
+                for inter_data in self.inter_data_list:
+                    msections = inter_data.mrope_input_positions
+                    if msections is None:
+                        for _seq_input_positions in inter_data.input_positions:
+                            mrope_input_positions[idx].extend(
+                                _seq_input_positions)
+                    else:
+                        for _seq_mrope_input_positions in msections:
+                            mrope_input_positions[idx].extend(
+                                _seq_mrope_input_positions[idx])
+            local_input_positions = None
+            offload_input_positions = None
+        else:
+            local_input_positions: list[int] = []
+            # offload_input_positions = []
+            offload_input_positions: list[list[int]] = [
+                [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+            ]
+            for idx, inter_data in enumerate(self.inter_data_list):
+                if idx < num_locals:
+                    for cur_input_positions in inter_data.input_positions:
+                        local_input_positions.extend(cur_input_positions)
+                else:
+                    prefill_rank = inter_data.prefill_rank
+                    for cur_input_positions in inter_data.input_positions:
+                        # offload_input_positions.extend(cur_input_positions)
+                        offload_input_positions[prefill_rank].extend(cur_input_positions)
+
+        local_seq_lens: list[int] = []
+        # offload_seq_lens = []
+        offload_seq_lens: list[list[int]] = [
+            [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+        ]
+        local_query_lens: list[int] = []
+        # offload_query_lens = []
+        offload_query_lens: list[list[int]] = [
+            [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+        ]
+        max_decode_seq_len = 0
+        max_encoder_seq_len = 0
+        for idx, inter_data in enumerate(self.inter_data_list):
+            if idx < num_locals:
+                local_seq_lens.extend(inter_data.seq_lens)
+                local_query_lens.extend(inter_data.query_lens)
+                if not inter_data.is_prompt:
+                    max_decode_seq_len = max(max_decode_seq_len, max(inter_data.seq_lens))
+                    if self.runner.model_config.is_encoder_decoder_model:
+                        max_encoder_seq_len = max(
+                            max_encoder_seq_len, inter_data.encoder_seq_len
+                        )
+            else:
+                prefill_rank = inter_data.prefill_rank
+                offload_seq_lens[prefill_rank].extend(inter_data.seq_lens)
+                offload_query_lens[prefill_rank].extend(inter_data.query_lens)
+
+        # Mapping from request IDs to sequence IDs. Used for Jamba models
+        # that manages the cache by itself.
+        request_ids_to_seq_ids = {
+            data.request_id: data.seq_ids
+            for data in self.inter_data_list
+        }
+
+        local_cuda_graph_pad_size = self._get_cuda_graph_pad_size(
+            num_seqs=len(local_seq_lens),
+            max_decode_seq_len=max_decode_seq_len,
+            max_encoder_seq_len=max_encoder_seq_len,
+        )
+        offload_num_seqs = [len(seq_lens) for seq_lens in offload_seq_lens]
+        offload_max_num_seqs = max(offload_num_seqs)
+        # FIXME: max decode seq len
+        offload_cuda_graph_pad_size = self._get_cuda_graph_pad_size(
+            num_seqs=offload_max_num_seqs,
+            max_decode_seq_len=max_decode_seq_len,
+            max_encoder_seq_len=max_encoder_seq_len,
+        )
+        offload_graph_batch_size = offload_max_num_seqs + offload_cuda_graph_pad_size
+        offload_cuda_graph_pad_sizes = [
+            offload_graph_batch_size - offload_num_seq
+            for offload_num_seq in offload_num_seqs
+        ]
+
+        local_batch_size = len(local_input_tokens)
+        if local_cuda_graph_pad_size != -1:
+            # If cuda graph can be used, pad tensors accordingly.
+            # See `capture_model` API for more details.
+            # vLLM uses cuda graph only for decoding requests.
+            local_batch_size += local_cuda_graph_pad_size
+
+        offload_batch_size = sum(len(seq_tokens) for seq_tokens in offload_input_tokens)
+        if offload_cuda_graph_pad_size != -1:
+            offload_batch_size = offload_graph_batch_size
+
+        # Tokens and positions.
+        if local_cuda_graph_pad_size != -1:
+            local_input_tokens.extend(itertools.repeat(0, local_cuda_graph_pad_size))
+        if offload_cuda_graph_pad_size != -1:
+            for offload_input_tokens_per_instance, pad_size in zip(
+                offload_input_tokens, offload_cuda_graph_pad_sizes
+            ):
+                offload_input_tokens_per_instance.extend(itertools.repeat(0, pad_size))
+        input_tokens = local_input_tokens + sum(offload_input_tokens, [])
+        assert self.runner.device is not None
+        input_tokens_tensor = async_tensor_h2d(
+            input_tokens, torch.long, self.runner.device, self.runner.pin_memory
+        )
+
+        if mrope_input_positions is not None:
+            for idx in range(3):
+                mrope_input_positions[idx].extend(
+                    itertools.repeat(0, local_cuda_graph_pad_size))
+            input_positions_tensor = async_tensor_h2d(mrope_input_positions,
+                                                      torch.long,
+                                                      self.runner.device,
+                                                      self.runner.pin_memory)
+        else:
+            if local_cuda_graph_pad_size != -1:
+                local_input_positions.extend(itertools.repeat(0, local_cuda_graph_pad_size))
+            if offload_cuda_graph_pad_size != -1:
+                for offload_input_positions_per_instance, pad_size in zip(
+                    offload_input_positions, offload_cuda_graph_pad_sizes
+                ):
+                    offload_input_positions_per_instance.extend(itertools.repeat(0, pad_size))
+            input_positions = local_input_positions + sum(offload_input_positions, [])
+            input_positions_tensor = async_tensor_h2d(
+                input_positions, torch.long, self.runner.device, self.runner.pin_memory
+            )
+        # Sequence and query lengths.
+        if local_cuda_graph_pad_size != -1:
+            local_seq_lens.extend(itertools.repeat(1, local_cuda_graph_pad_size))
+        if offload_cuda_graph_pad_size != -1:
+            for offload_seq_lens_per_instance, pad_size in zip(
+                offload_seq_lens, offload_cuda_graph_pad_sizes
+            ):
+                offload_seq_lens_per_instance.extend(itertools.repeat(1, pad_size))
+        seq_lens = local_seq_lens + sum(offload_seq_lens, [])
+        query_lens = local_query_lens + sum(offload_query_lens, [])
+
+        # Attention metadata.
+        from adrenaline.attention.backends.flashinfer import AdrenalineFlashInferMetadataBuilder
+        assert isinstance(self.attn_metadata_builder, AdrenalineFlashInferMetadataBuilder)
+        attn_metadata = self.attn_metadata_builder.build(
+            local_seq_lens, local_query_lens, local_cuda_graph_pad_size, local_batch_size, num_locals, num_offloads
+        )
+        attn_metadata.num_locals_padded_for_graph = local_batch_size
+        attn_metadata.num_offloads_padded_for_graph = offload_batch_size
+
+        # LoRA data.
+        lora_requests = set()
+        lora_mapping = None
+        if self.enable_lora:
+            lora_requests = set(r for data in self.inter_data_list
+                                for r in data.lora_requests)
+            lora_index_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_index_mapping)
+                for inter_data in self.inter_data_list
+            ])
+            if local_cuda_graph_pad_size:
+                lora_index_mapping.extend(
+                    itertools.repeat(0, local_cuda_graph_pad_size))
+            lora_prompt_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_prompt_mapping)
+                for inter_data in self.inter_data_list
+            ])
+
+            lora_mapping = LoRAMapping(
+                **dict(index_mapping=lora_index_mapping,
+                       prompt_mapping=lora_prompt_mapping,
+                       is_prefill=not self.decode_only))
+
+        # Prompt adapter data.
+        prompt_adapter_requests: Set[PromptAdapterRequest] = set()
+        prompt_adapter_mapping = None
+        if self.enable_prompt_adapter:
+            prompt_adapter_requests = set(
+                data.prompt_adapter_request for data in self.inter_data_list
+                if data.prompt_adapter_request is not None)
+            prompt_adapter_index_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_index_mapping
+                for inter_data in self.inter_data_list
+            ])
+            if local_cuda_graph_pad_size:
+                prompt_adapter_index_mapping.extend(
+                    itertools.repeat(0, local_cuda_graph_pad_size))
+            prompt_adapter_prompt_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_prompt_mapping
+                for inter_data in self.inter_data_list
+            ])
+            prompt_adapter_mapping = PromptAdapterMapping(
+                prompt_adapter_index_mapping,
+                prompt_adapter_prompt_mapping,
+            )
+
+        # Multi-modal data.
+        multi_modal_inputs_list = [
+            data.multi_modal_inputs for data in self.inter_data_list
+            if data.multi_modal_inputs is not None
+        ]
+        multi_modal_kwargs = MultiModalInputs.batch(multi_modal_inputs_list)
+
+        # used for recv kvcache from prefill rank
+        prefill_ranks = [
+            data.prefill_rank for data in self.inter_data_list
+        ]
+        request_ids = [data.request_id for data in self.inter_data_list]
+
+        # used for async recv KV cache
+        is_recv_fins: List[bool] = [
+            data.is_recv_fin for data in self.inter_data_list
+        ]
+
+        return self.model_input_cls(
+            input_tokens=input_tokens_tensor,
+            input_positions=input_positions_tensor,
+            attn_metadata=attn_metadata,
+            seq_lens=seq_lens,
+            query_lens=query_lens,
+            lora_mapping=lora_mapping,
+            lora_requests=lora_requests,
+            multi_modal_kwargs=multi_modal_kwargs,
+            request_ids_to_seq_ids=request_ids_to_seq_ids,
+            finished_requests_ids=self.finished_requests_ids,
+            prompt_adapter_mapping=prompt_adapter_mapping,
+            prompt_adapter_requests=prompt_adapter_requests,
+            prefill_ranks=prefill_ranks,
+            request_ids=request_ids,
+            is_recv_fins=is_recv_fins,
+        )
+
+    def build_model_input_for_decode_without_offload(
+        self, num_locals: int, num_offloads: int
+    ) -> ModelInputForGPU:
+        return self.original_build_with_offload(num_locals, num_offloads)
+
+    def build_model_input_for_attn_with_offload(
+        self, num_locals: int, num_offloads: int
+    ) -> ModelInputForGPU:
+        assert dist_kv.IS_ATTN_EXECUTOR
+        attn_rank = dist_kv.get_attn_rank()
+        # input_tokens = []
+        input_tokens: list[list[int]] = [
+            [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+        ]
+        for inter_data in self.inter_data_list:
+            prefill_rank = inter_data.prefill_rank
+            for cur_input_tokens in inter_data.input_tokens:
+                # input_tokens.extend(cur_input_tokens)
+                input_tokens[prefill_rank].extend(cur_input_tokens)
+
+        if not input_tokens:
+            # This may happen when all prefill requests hit
+            # prefix caching and there is no decode request.
+            return self.model_input_cls()
+
+        mrope_input_positions: Optional[List[List[int]]] = None
+        if any(inter_data.mrope_input_positions is not None
+               for inter_data in self.inter_data_list):
+            mrope_input_positions = [[] for _ in range(3)]
+            for idx in range(3):
+                for inter_data in self.inter_data_list:
+                    msections = inter_data.mrope_input_positions
+                    if msections is None:
+                        for _seq_input_positions in inter_data.input_positions:
+                            mrope_input_positions[idx].extend(
+                                _seq_input_positions)
+                    else:
+                        for _seq_mrope_input_positions in msections:
+                            mrope_input_positions[idx].extend(
+                                _seq_mrope_input_positions[idx])
+            input_positions = None
+        else:
+            input_positions: list[list[int]] = [
+                [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+            ]
+            for inter_data in self.inter_data_list:
+                prefill_rank = inter_data.prefill_rank
+                for cur_input_positions in inter_data.input_positions:
+                    input_positions[prefill_rank].extend(cur_input_positions)
+
+        seq_lens: list[list[int]] = [[] for _ in range(dist_kv.NUM_ATTN_INSTANCES)]
+        query_lens: list[list[int]] = [[] for _ in range(dist_kv.NUM_ATTN_INSTANCES)]
+        max_decode_seq_len = 0
+        max_encoder_seq_len = 0
+        for inter_data in self.inter_data_list:
+            prefill_rank = inter_data.prefill_rank
+            seq_lens[prefill_rank].extend(inter_data.seq_lens)
+            query_lens[prefill_rank].extend(inter_data.query_lens)
+            if not inter_data.is_prompt and prefill_rank == attn_rank:
+                max_decode_seq_len = max(max_decode_seq_len,
+                                         max(inter_data.seq_lens))
+                if self.runner.model_config.is_encoder_decoder_model:
+                    max_encoder_seq_len = max(max_encoder_seq_len,
+                                              inter_data.encoder_seq_len)
+
+        # Mapping from request IDs to sequence IDs. Used for Jamba models
+        # that manages the cache by itself.
+        request_ids_to_seq_ids = {
+            data.request_id: data.seq_ids
+            for data in self.inter_data_list
+        }
+
+        num_seqs = [len(seq_lens_per_instance) for seq_lens_per_instance in seq_lens]   
+        max_num_seqs = max(num_seqs)
+        # FIXME: max decode seq len
+        cuda_graph_pad_size = self._get_cuda_graph_pad_size(
+            num_seqs=max_num_seqs,
+            max_decode_seq_len=max_decode_seq_len,
+            max_encoder_seq_len=max_encoder_seq_len)
+        use_cuda_graph = cuda_graph_pad_size != -1
+        graph_batch_size = max_num_seqs + cuda_graph_pad_size
+        cuda_graph_pad_sizes = [
+            graph_batch_size - num_seq for num_seq in num_seqs
+        ]
+
+        batch_size = len(input_tokens[attn_rank])
+        if use_cuda_graph:
+            # If cuda graph can be used, pad tensors accordingly.
+            # See `capture_model` API for more details.
+            # vLLM uses cuda graph only for decoding requests.
+            batch_size += cuda_graph_pad_sizes[attn_rank]
+
+        # Tokens and positions.
+        if use_cuda_graph:
+            for input_tokens_per_instance, pad_size in zip(
+                input_tokens, cuda_graph_pad_sizes
+            ):
+                input_tokens_per_instance.extend(itertools.repeat(0, pad_size))
+        total_input_tokens = sum(input_tokens, [])
+        assert self.runner.device is not None
+        input_tokens_tensor = async_tensor_h2d(
+            total_input_tokens, torch.long, self.runner.device, self.runner.pin_memory
+        )
+        if mrope_input_positions is not None:
+            for idx in range(3):
+                mrope_input_positions[idx].extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            input_positions_tensor = async_tensor_h2d(mrope_input_positions,
+                                                      torch.long,
+                                                      self.runner.device,
+                                                      self.runner.pin_memory)
+        else:
+            if use_cuda_graph:
+                for input_positions_per_instance, pad_size in zip(
+                    input_positions, cuda_graph_pad_sizes
+                ):
+                    input_positions_per_instance.extend(itertools.repeat(0, pad_size))
+            total_input_positions = sum(input_positions, [])
+            input_positions_tensor = async_tensor_h2d(total_input_positions,
+                                                      torch.long,
+                                                      self.runner.device,
+                                                      self.runner.pin_memory)
+        # Sequence and query lengths.
+        if use_cuda_graph:
+            for seq_lens_per_instance, pad_size in zip(seq_lens, cuda_graph_pad_sizes):
+                seq_lens_per_instance.extend(itertools.repeat(1, pad_size))
+        total_seq_lens = sum(seq_lens, [])
+        total_query_lens = sum(query_lens, [])
+
+        # Attention metadata.
+        from adrenaline.attention.backends.flashinfer import AdrenalineFlashInferMetadataBuilder
+        assert isinstance(self.attn_metadata_builder, AdrenalineFlashInferMetadataBuilder)
+        attn_cuda_graph_pad_size = cuda_graph_pad_sizes[attn_rank] if use_cuda_graph else -1
+        attn_metadata = self.attn_metadata_builder.build(
+            seq_lens[attn_rank], query_lens[attn_rank], attn_cuda_graph_pad_size, batch_size, num_locals, num_offloads
+        )
+        attn_metadata.num_offloads_padded_for_graph = graph_batch_size
+
+        # LoRA data.
+        lora_requests = set()
+        lora_mapping = None
+        if self.enable_lora:
+            lora_requests = set(r for data in self.inter_data_list
+                                for r in data.lora_requests)
+            lora_index_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_index_mapping)
+                for inter_data in self.inter_data_list
+            ])
+            if cuda_graph_pad_size:
+                lora_index_mapping.extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            lora_prompt_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_prompt_mapping)
+                for inter_data in self.inter_data_list
+            ])
+
+            lora_mapping = LoRAMapping(
+                **dict(index_mapping=lora_index_mapping,
+                       prompt_mapping=lora_prompt_mapping,
+                       is_prefill=not self.decode_only))
+
+        # Prompt adapter data.
+        prompt_adapter_requests: Set[PromptAdapterRequest] = set()
+        prompt_adapter_mapping = None
+        if self.enable_prompt_adapter:
+            prompt_adapter_requests = set(
+                data.prompt_adapter_request for data in self.inter_data_list
+                if data.prompt_adapter_request is not None)
+            prompt_adapter_index_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_index_mapping
+                for inter_data in self.inter_data_list
+            ])
+            if cuda_graph_pad_size:
+                prompt_adapter_index_mapping.extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            prompt_adapter_prompt_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_prompt_mapping
+                for inter_data in self.inter_data_list
+            ])
+            prompt_adapter_mapping = PromptAdapterMapping(
+                prompt_adapter_index_mapping,
+                prompt_adapter_prompt_mapping,
+            )
+
+        # Multi-modal data.
+        multi_modal_inputs_list = [
+            data.multi_modal_inputs for data in self.inter_data_list
+            if data.multi_modal_inputs is not None
+        ]
+        multi_modal_kwargs = MultiModalInputs.batch(multi_modal_inputs_list)
+
+        # only used in prefill stage to recv kvcache from prefill rank
+        prefill_ranks = [
+            data.prefill_rank for data in self.inter_data_list
+        ]
+        request_ids = [data.request_id for data in self.inter_data_list]
+
+        # used for async recv KV cache
+        is_recv_fins: List[bool] = [
+            data.is_recv_fin for data in self.inter_data_list
+        ]
+
+        return self.model_input_cls(
+            input_tokens=input_tokens_tensor,
+            input_positions=input_positions_tensor,
+            attn_metadata=attn_metadata,
+            seq_lens=total_seq_lens,
+            query_lens=total_query_lens,
+            lora_mapping=lora_mapping,
+            lora_requests=lora_requests,
+            multi_modal_kwargs=multi_modal_kwargs,
+            request_ids_to_seq_ids=request_ids_to_seq_ids,
+            finished_requests_ids=self.finished_requests_ids,
+            prompt_adapter_mapping=prompt_adapter_mapping,
+            prompt_adapter_requests=prompt_adapter_requests,
+            prefill_ranks=prefill_ranks,
+            request_ids=request_ids,
+            is_recv_fins=is_recv_fins,
+        )
+
+    def original_build_with_offload(
+        self, num_locals: int, num_offloads: int
+    ) -> ModelInputForGPU:
+        input_tokens = []
+        for inter_data in self.inter_data_list:
+            for cur_input_tokens in inter_data.input_tokens:
+                input_tokens.extend(cur_input_tokens)
+
+        if not input_tokens:
+            # This may happen when all prefill requests hit
+            # prefix caching and there is no decode request.
+            return self.model_input_cls()
+
+        mrope_input_positions: Optional[List[List[int]]] = None
+        if any(inter_data.mrope_input_positions is not None
+               for inter_data in self.inter_data_list):
+            mrope_input_positions = [[] for _ in range(3)]
+            for idx in range(3):
+                for inter_data in self.inter_data_list:
+                    msections = inter_data.mrope_input_positions
+                    if msections is None:
+                        for _seq_input_positions in inter_data.input_positions:
+                            mrope_input_positions[idx].extend(
+                                _seq_input_positions)
+                    else:
+                        for _seq_mrope_input_positions in msections:
+                            mrope_input_positions[idx].extend(
+                                _seq_mrope_input_positions[idx])
+            input_positions = None
+        else:
+            input_positions = []
+            for inter_data in self.inter_data_list:
+                for cur_input_positions in inter_data.input_positions:
+                    input_positions.extend(cur_input_positions)
+
+        seq_lens = []
+        query_lens = []
+        max_decode_seq_len = 0
+        max_encoder_seq_len = 0
+        for inter_data in self.inter_data_list:
+            seq_lens.extend(inter_data.seq_lens)
+            query_lens.extend(inter_data.query_lens)
+            if not inter_data.is_prompt:
+                max_decode_seq_len = max(max_decode_seq_len,
+                                         max(inter_data.seq_lens))
+                if self.runner.model_config.is_encoder_decoder_model:
+                    max_encoder_seq_len = max(max_encoder_seq_len,
+                                              inter_data.encoder_seq_len)
+
+        # Mapping from request IDs to sequence IDs. Used for Jamba models
+        # that manages the cache by itself.
+        request_ids_to_seq_ids = {
+            data.request_id: data.seq_ids
+            for data in self.inter_data_list
+        }
+
+        cuda_graph_pad_size = self._get_cuda_graph_pad_size(
+            num_seqs=len(seq_lens),
+            max_decode_seq_len=max_decode_seq_len,
+            max_encoder_seq_len=max_encoder_seq_len)
+
+        batch_size = len(input_tokens)
+        if cuda_graph_pad_size != -1:
+            # If cuda graph can be used, pad tensors accordingly.
+            # See `capture_model` API for more details.
+            # vLLM uses cuda graph only for decoding requests.
+            batch_size += cuda_graph_pad_size
+
+        # Tokens and positions.
+        if cuda_graph_pad_size:
+            input_tokens.extend(itertools.repeat(0, cuda_graph_pad_size))
+        assert self.runner.device is not None
+        input_tokens_tensor = async_tensor_h2d(input_tokens, torch.long,
+                                               self.runner.device,
+                                               self.runner.pin_memory)
+        if mrope_input_positions is not None:
+            for idx in range(3):
+                mrope_input_positions[idx].extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            input_positions_tensor = async_tensor_h2d(mrope_input_positions,
+                                                      torch.long,
+                                                      self.runner.device,
+                                                      self.runner.pin_memory)
+        else:
+            input_positions.extend(itertools.repeat(0, cuda_graph_pad_size))
+            input_positions_tensor = async_tensor_h2d(input_positions,
+                                                      torch.long,
+                                                      self.runner.device,
+                                                      self.runner.pin_memory)
+        # Sequence and query lengths.
+        if cuda_graph_pad_size:
+            seq_lens.extend(itertools.repeat(1, cuda_graph_pad_size))
+
+        # Attention metadata.
+        from adrenaline.attention.backends.flashinfer import AdrenalineFlashInferMetadataBuilder
+        assert isinstance(self.attn_metadata_builder, AdrenalineFlashInferMetadataBuilder)
+        attn_metadata = self.attn_metadata_builder.build(
+            seq_lens, query_lens, cuda_graph_pad_size, batch_size, num_locals, num_offloads
+        )
+
+        # LoRA data.
+        lora_requests = set()
+        lora_mapping = None
+        if self.enable_lora:
+            lora_requests = set(r for data in self.inter_data_list
+                                for r in data.lora_requests)
+            lora_index_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_index_mapping)
+                for inter_data in self.inter_data_list
+            ])
+            if cuda_graph_pad_size:
+                lora_index_mapping.extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            lora_prompt_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_prompt_mapping)
+                for inter_data in self.inter_data_list
+            ])
+
+            lora_mapping = LoRAMapping(
+                **dict(index_mapping=lora_index_mapping,
+                       prompt_mapping=lora_prompt_mapping,
+                       is_prefill=not self.decode_only))
+
+        # Prompt adapter data.
+        prompt_adapter_requests: Set[PromptAdapterRequest] = set()
+        prompt_adapter_mapping = None
+        if self.enable_prompt_adapter:
+            prompt_adapter_requests = set(
+                data.prompt_adapter_request for data in self.inter_data_list
+                if data.prompt_adapter_request is not None)
+            prompt_adapter_index_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_index_mapping
+                for inter_data in self.inter_data_list
+            ])
+            if cuda_graph_pad_size:
+                prompt_adapter_index_mapping.extend(
+                    itertools.repeat(0, cuda_graph_pad_size))
+            prompt_adapter_prompt_mapping = flatten_2d_lists([
+                inter_data.prompt_adapter_prompt_mapping
+                for inter_data in self.inter_data_list
+            ])
+            prompt_adapter_mapping = PromptAdapterMapping(
+                prompt_adapter_index_mapping,
+                prompt_adapter_prompt_mapping,
+            )
+
+        # Multi-modal data.
+        multi_modal_inputs_list = [
+            data.multi_modal_inputs for data in self.inter_data_list
+            if data.multi_modal_inputs is not None
+        ]
+        multi_modal_kwargs = MultiModalInputs.batch(multi_modal_inputs_list)
+
+        # PD disaggregation
+        prefill_ranks = [
+            data.prefill_rank for data in self.inter_data_list
+        ]
+        request_ids = [data.request_id for data in self.inter_data_list]
+
+        # used for async recv KV cache
+        is_recv_fins: List[bool] = [
+            data.is_recv_fin for data in self.inter_data_list
+        ]
+
+        return self.model_input_cls(
+            input_tokens=input_tokens_tensor,
+            input_positions=input_positions_tensor,
+            attn_metadata=attn_metadata,
+            seq_lens=seq_lens,
+            query_lens=query_lens,
+            lora_mapping=lora_mapping,
+            lora_requests=lora_requests,
+            multi_modal_kwargs=multi_modal_kwargs,
+            request_ids_to_seq_ids=request_ids_to_seq_ids,
+            finished_requests_ids=self.finished_requests_ids,
+            prompt_adapter_mapping=prompt_adapter_mapping,
+            prompt_adapter_requests=prompt_adapter_requests,
+            prefill_ranks=prefill_ranks,
+            request_ids=request_ids,
+            is_recv_fins=is_recv_fins,
+        )
+
+    def build_model_input_with_offload(
+        self, num_locals: int, num_offloads: int
+    ) -> ModelInputForGPU:
+        if dist_kv.IS_KV_PRODUCER:
+            return self.build_model_input_for_prefill_with_offload(
+                num_locals, num_offloads
+            )
+        elif dist_kv.IS_KV_CONSUMER:
+            if num_offloads > 0:
+                return self.build_model_input_for_decode_with_offload(
+                    num_locals, num_offloads
+                )
+            else:
+                return self.build_model_input_for_decode_without_offload(
+                    num_locals, num_offloads
+                )
+        else:
+            assert dist_kv.IS_ATTN_EXECUTOR
+            return self.build_model_input_for_attn_with_offload(
+                num_locals, num_offloads
+            )
 
     def build(self) -> ModelInputForGPU:
         """Finalize the builder intermediate data and
@@ -1006,6 +1723,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         # in numpy and only copy the actual input content at every iteration.
         # The shape of the cached block table will be
         # (max batch size to capture, max seq len to capture / block size).
+        self.max_batchsize_to_capture = int(
+            os.environ.get("VLLM_MAX_GRAPH_BATCH", str(self.max_batchsize_to_capture))
+        )
         self.graph_block_tables = np.zeros(
             (self.max_batchsize_to_capture, self.get_max_block_per_batch()),
             dtype=np.int32)
@@ -1175,7 +1895,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-        finished_requests_ids: Optional[List[str]] = None
+        finished_requests_ids: Optional[List[str]] = None,
+        local_list: list[SequenceGroupMetadata] = [],
+        offload_list: list[SequenceGroupMetadata] = [],
     ) -> TModelInputForGPU:
         """Helper method to prepare the model input based on a given sequence
         group. Prepares metadata needed for the base model forward pass but not
@@ -1192,12 +1914,21 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         If cuda graph is required, this API automatically pads inputs.
         """
         builder = self._builder_cls(weakref.proxy(self), finished_requests_ids)
-        for seq_group_metadata in seq_group_metadata_list:
+        assert len(local_list) + len(offload_list) == len(seq_group_metadata_list)
+        for seq_group_metadata in local_list + offload_list:
             builder.add_seq_group(seq_group_metadata)
 
         builder.reset_cached_inter_data()
-
-        return builder.build()  # type: ignore
+        num_locals = len(local_list)
+        num_offloads = len(offload_list)
+        if dist_kv.ENABLE_KV_OFFLOAD:
+            model_input_for_gpu = builder.build_model_input_with_offload(num_locals, num_offloads)
+        elif dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
+            assert num_offloads == 0
+            model_input_for_gpu = builder.original_build_with_offload(num_locals, num_offloads)
+        else:
+            model_input_for_gpu = builder.build()  # type: ignore
+        return model_input_for_gpu
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -1383,7 +2114,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         return uses_mrope(self.model_config.hf_config)
 
     @torch.inference_mode()
-    def capture_model(self, kv_caches: List[List[torch.Tensor]]) -> None:
+    def capture_model(
+        self,
+        kv_caches: List[List[torch.Tensor]],
+        batch_size_capture_list: Optional[list[int]] = None,
+    ) -> None:
         """Cuda graph capture a model.
 
         Note that CUDA graph's performance gain is negligible if number
@@ -1432,10 +2167,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 dtype=self.model_config.dtype,
                 device=self.device)
 
-        graph_batch_size = self.max_batchsize_to_capture
-        batch_size_capture_list = [
-            bs for bs in _BATCH_SIZES_TO_CAPTURE if bs <= graph_batch_size
-        ]
+        if batch_size_capture_list is None:
+            graph_batch_size = self.max_batchsize_to_capture
+            batch_size_capture_list = [
+                bs for bs in _BATCH_SIZES_TO_CAPTURE if bs <= graph_batch_size
+            ]
 
         with self.attn_state.graph_capture(
                 max_batch_size), graph_capture() as graph_capture_context:
@@ -1579,19 +2315,41 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         If cuda graph is required, this API automatically pads inputs.
         """
+        local_list: list[SequenceGroupMetadata] = []
+        offload_list: list[list[SequenceGroupMetadata]] = [
+            [] for _ in range(dist_kv.NUM_ATTN_INSTANCES)
+        ]
+        for m in seq_group_metadata_list:
+            if m.sampling_params.offload:
+                offload_list[m.sampling_params.prefill_rank].append(m)
+            else:
+                local_list.append(m)
+        total_offload_list = sum(offload_list, [])
         model_input = self._prepare_model_input_tensors(
-            seq_group_metadata_list, finished_requests_ids)
+            seq_group_metadata_list, finished_requests_ids, local_list, total_offload_list)
+        is_prompt = (seq_group_metadata_list[0].is_prompt
+                     if seq_group_metadata_list else None)
         if get_pp_group().is_last_rank:
             # Sampling metadata is only required for the final pp group
             generators = self.get_generators(finished_requests_ids)
+
+            num_locals_padded_for_graph, num_offloads_padded_for_graph = None, None
+            num_local_reqs, num_offload_reqs = None, None
+            if not is_prompt:
+                num_locals_padded_for_graph: int = model_input.attn_metadata.decode_metadata.num_locals_padded_for_graph
+                num_offloads_padded_for_graph: int = model_input.attn_metadata.decode_metadata.num_offloads_padded_for_graph
+                num_local_reqs = len(local_list)
+                num_offload_reqs = [len(sg_metas) for sg_metas in offload_list]
+
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list, model_input.seq_lens,
                 model_input.query_lens, self.device, self.pin_memory,
-                generators, self.sampling_metadata_cache)
+                generators, self.sampling_metadata_cache,
+                is_prompt, num_locals_padded_for_graph, num_offloads_padded_for_graph,
+                num_local_reqs, num_offload_reqs
+            )
         else:
             sampling_metadata = None
-        is_prompt = (seq_group_metadata_list[0].is_prompt
-                     if seq_group_metadata_list else None)
         return dataclasses.replace(model_input,
                                    sampling_metadata=sampling_metadata,
                                    is_prompt=is_prompt,
@@ -1644,18 +2402,32 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # model forwarding
         # In KV cache database setting, it will change the model input so that
         # we can skip prefilling on tokens that successfully received KV caches
-        # NOTE: The receive operation is blocking
         bypass_model_exec = False
-        if self.need_recv_kv(model_input, kv_caches):
-            hidden_or_intermediate_states, bypass_model_exec, model_input = \
-                get_disagg_group().recv_kv_caches_and_hidden_states(
+        bypass_output_process = False
+        if self.is_prefill_sche_iteration(model_input, kv_caches):
+            sync_groups = [get_tp_group().recving_sync_group, get_pp_group().recving_sync_group]
+            hidden_or_intermediate_states, bypass_model_exec, model_input = (
+                get_disagg_group().async_recv_kv_caches_and_hidden_states(
                     # model is used to know which layer the current worker
                     # is working on, so that we can receive KV for only those
                     # layers.
                     model_executable,
                     model_input,
-                    kv_caches=kv_caches
+                    kv_caches=kv_caches,
+                    sync_groups=sync_groups,
                 )
+            )
+            bypass_output_process = True
+        elif self.is_prefill_ready_iteration(model_input):
+            # extract_hidden_states in prefill ready iteration
+            logger.debug("[ModelProgress] Extract hidden_states starts.")
+            hidden_or_intermediate_states, bypass_model_exec, model_input = (
+                get_disagg_group().extract_hidden_for_ready_requests(model_input)
+            )
+            bypass_output_process = False
+            sync_groups = [get_tp_group().fin_recv_sync_group, get_pp_group().fin_recv_sync_group]
+            for sync_group in sync_groups:
+                torch.distributed.barrier(sync_group)
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
@@ -1716,6 +2488,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
+        if bypass_output_process:
+            logger.debug("[ModelProgress] Bypass output processing.")
+            if model_input.async_callback is not None:
+                model_input.async_callback()
+            return []
+
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 
@@ -1764,7 +2542,213 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         return [output]
 
-    def need_recv_kv(self, model_input, kv_caches) -> bool:
+    @torch.inference_mode()
+    @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
+    def profile_model_execute(
+        self,
+        model_input: ModelInputForGPUWithSamplingMetadata,
+        kv_caches: List[torch.Tensor],
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        num_steps: int = 1,
+    ) -> tuple[float, float, float]:
+        if num_steps > 1:
+            raise ValueError("num_steps > 1 is not supported in ModelRunner")
+
+        if self.lora_config:
+            assert model_input.lora_requests is not None
+            assert model_input.lora_mapping is not None
+            self.set_active_loras(model_input.lora_requests,
+                                  model_input.lora_mapping)
+
+        if self.prompt_adapter_config:
+            assert model_input.prompt_adapter_requests is not None
+            assert model_input.prompt_adapter_mapping is not None
+            self.set_active_prompt_adapters(
+                model_input.prompt_adapter_requests,
+                model_input.prompt_adapter_mapping)
+
+        self.attn_state.begin_forward(model_input)
+        gpu_execute_start: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        gpu_execute_end: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        forward_model_start: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        forward_model_end: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        gpu_execute_start.record()
+        cpu_execute_start = time.perf_counter()
+
+        # Currently cuda graph is only supported by the decode phase.
+        assert model_input.attn_metadata is not None
+        prefill_meta = model_input.attn_metadata.prefill_metadata
+        decode_meta = model_input.attn_metadata.decode_metadata
+        # TODO(andoorve): We can remove this once all
+        # virtual engines share the same kv cache.
+        virtual_engine = model_input.virtual_engine
+        if prefill_meta is None and decode_meta.use_cuda_graph:
+            assert model_input.input_tokens is not None
+            graph_batch_size = model_input.input_tokens.shape[0]
+            model_executable = self.graph_runners[virtual_engine][
+                graph_batch_size]
+        else:
+            model_executable = self.model
+
+        # Receive KV cache in distributed KV cache transfer setting
+        # In disagg prefill setting, it will also recv hidden states and bypass
+        # model forwarding
+        # In KV cache database setting, it will change the model input so that
+        # we can skip prefilling on tokens that successfully received KV caches
+        bypass_model_exec = False
+        bypass_output_process = False
+        if self.is_prefill_sche_iteration(model_input, kv_caches):
+            hidden_or_intermediate_states, bypass_model_exec, model_input = (
+                get_disagg_group().async_recv_kv_caches_and_hidden_states(
+                    # model is used to know which layer the current worker
+                    # is working on, so that we can receive KV for only those
+                    # layers.
+                    model_executable,
+                    model_input,
+                    kv_caches=kv_caches
+                )
+            )
+            bypass_output_process = True
+        elif self.is_prefill_ready_iteration(model_input):
+            # extract_hidden_states in prefill ready iteration
+            logger.debug("[ModelProgress] Extract hidden_states starts.")
+            hidden_or_intermediate_states, bypass_model_exec, model_input = (
+                get_disagg_group().extract_hidden_for_ready_requests(model_input)
+            )
+            bypass_output_process = False
+
+        multi_modal_kwargs = model_input.multi_modal_kwargs or {}
+        seqlen_agnostic_kwargs = {
+            "finished_requests_ids": model_input.finished_requests_ids,
+            "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
+        } if self.has_inner_state else {}
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time):
+            model_forward_start = torch.cuda.Event(enable_timing=True)
+            model_forward_end = torch.cuda.Event(enable_timing=True)
+            model_forward_start.record()
+
+        forward_model_start.record()
+        if not bypass_model_exec:
+            with set_forward_context(model_input.attn_metadata):
+                hidden_or_intermediate_states = model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                                 device=self.device),
+                    **seqlen_agnostic_kwargs)
+        forward_model_end.record()
+
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time):
+            model_forward_end.record()
+
+        # Sending KV cache in distributed KV cache transfer setting
+        # NOTE: the send operation is non-blocking
+        if self.need_send_kv(model_input, kv_caches):
+            get_disagg_group().send_kv_caches_and_hidden_states(
+                # model_executable is used to know which layer the current
+                # worker is working on, so that we can send KV for only those
+                # layers.
+                model_executable,
+                model_input,
+                kv_caches,
+                hidden_or_intermediate_states,
+            )
+
+        # Compute the logits in the last pipeline stage.
+        if not get_pp_group().is_last_rank:
+            if (self.is_driver_worker
+                    and hidden_or_intermediate_states is not None
+                    and isinstance(hidden_or_intermediate_states,
+                                   IntermediateTensors)
+                    and self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time):
+                model_forward_end.synchronize()
+                model_forward_time = model_forward_start.elapsed_time(
+                    model_forward_end)
+                orig_model_forward_time = 0.0
+                if intermediate_tensors is not None:
+                    orig_model_forward_time = intermediate_tensors.tensors.get(
+                        "model_forward_time", torch.tensor(0.0)).item()
+                hidden_or_intermediate_states.tensors["model_forward_time"] = (
+                    torch.tensor(model_forward_time + orig_model_forward_time))
+            return hidden_or_intermediate_states
+
+        if bypass_output_process:
+            logger.debug("[ModelProgress] Bypass output processing.")
+            if model_input.async_callback is not None:
+                model_input.async_callback()
+            return []
+
+        logits = self.model.compute_logits(hidden_or_intermediate_states,
+                                           model_input.sampling_metadata)
+
+        if not self.is_driver_worker:
+            return []
+
+        if model_input.async_callback is not None:
+            model_input.async_callback()
+
+        # Sample the next token.
+        output: SamplerOutput = self.model.sample(
+            logits=logits,
+            sampling_metadata=model_input.sampling_metadata,
+        )
+        gpu_execute_end.record()
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time
+                and output is not None):
+            model_forward_end.synchronize()
+            model_forward_time = model_forward_start.elapsed_time(
+                model_forward_end)
+            orig_model_forward_time = 0.0
+            if intermediate_tensors is not None:
+                orig_model_forward_time = intermediate_tensors.tensors.get(
+                    "model_forward_time", torch.tensor(0.0)).item()
+            # If there are multiple workers, we are still tracking the latency
+            # from the start time of the driver worker to the end time of the
+            # driver worker. The model forward time will then end up covering
+            # the communication time as well.
+            output.model_forward_time = (orig_model_forward_time +
+                                         model_forward_time)
+
+        if self.return_hidden_states:
+            # we only need to pass hidden states of most recent token
+            assert model_input.sampling_metadata is not None
+            indices = model_input.sampling_metadata.selected_token_indices
+            if model_input.is_prompt:
+                hidden_states = hidden_or_intermediate_states.index_select(
+                    0, indices)
+                output.prefill_hidden_states = hidden_or_intermediate_states
+            elif decode_meta.use_cuda_graph:
+                hidden_states = hidden_or_intermediate_states[:len(indices)]
+            else:
+                hidden_states = hidden_or_intermediate_states
+
+            output.hidden_states = hidden_states
+
+        gpu_execute_end.synchronize()
+        cpu_execute_end = time.perf_counter()
+        forward_model_time = forward_model_start.elapsed_time(forward_model_end)
+        gpu_time = gpu_execute_start.elapsed_time(gpu_execute_end)
+        cpu_time = (cpu_execute_end - cpu_execute_start) * 1000
+
+        return forward_model_time, gpu_time, cpu_time
+
+    def is_prefill_ready_iteration(self, model_input: ModelInputForGPUWithSamplingMetadata) -> bool:
+        if not dist_kv.IS_DISTRIBUTED_KV_INSTANCE:
+            return False
+        if not model_input.is_prompt:
+            return False
+        is_recv_fin = any(flag for flag in model_input.is_recv_fins)
+        assert all([is_recv_fin == flag for flag in model_input.is_recv_fins])
+        return is_recv_fin
+
+    def is_prefill_sche_iteration(self, model_input: ModelInputForGPUWithSamplingMetadata, kv_caches) -> bool:
         """Check if we need to receive kv-cache from the other worker.
         We need to receive KV when
             1. current vLLM instance is KV cache consumer/decode vLLM instance
@@ -1776,15 +2760,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             kv_caches: vLLM's paged memory
         """
 
-        prefill_meta = model_input.attn_metadata.prefill_metadata
-
         # check if the current run is profiling
         is_profile_run = (kv_caches[0].numel() == 0)
         # check if the current run is prefill
-        is_prefill_run = prefill_meta is not None
+        is_prefill_run = model_input.is_prompt
+        # check if the current run is recvive finished iteration
+        is_recving_finished = self.is_prefill_ready_iteration(model_input)
 
-        return dist_kv.IS_KV_CONSUMER and (
-            not is_profile_run) and is_prefill_run
+        return (
+            dist_kv.IS_KV_CONSUMER
+            and (not is_profile_run)
+            and is_prefill_run
+            and (not is_recving_finished)
+        )
 
     def need_send_kv(self, model_input, kv_caches) -> bool:
         """Check if we need to send kv-cache to the other worker.
@@ -1971,6 +2959,8 @@ def _get_graph_batch_size(batch_size: int) -> int:
         return batch_size
     elif batch_size <= 4:
         return 4
+    elif batch_size <= 8:
+        return 8
     else:
         return ((batch_size + _BATCH_SIZE_ALIGNMENT - 1) //
                 _BATCH_SIZE_ALIGNMENT * _BATCH_SIZE_ALIGNMENT)

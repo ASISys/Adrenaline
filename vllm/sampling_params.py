@@ -182,7 +182,7 @@ class SamplingParams(
     stop_token_ids: Optional[List[int]] = None
     bad_words: Optional[List[str]] = None
     ignore_eos: bool = False
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[int] = None
     min_tokens: int = 0
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
@@ -209,6 +209,13 @@ class SamplingParams(
     logit_bias: Optional[Dict[int, float]] = None
     allowed_token_ids: Optional[List[int]] = None
 
+    # Fields used to offload generation to a separate process
+    offload: bool = False
+    prefill_rank: int = 0
+
+    # Fields used to async recv KV cache
+    is_recv_fin: Optional[bool] = False
+
     @staticmethod
     def from_optional(
         n: Optional[int] = 1,
@@ -226,7 +233,7 @@ class SamplingParams(
         bad_words: Optional[List[str]] = None,
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
-        max_tokens: Optional[int] = 16,
+        max_tokens: Optional[int] = None,
         min_tokens: int = 0,
         logprobs: Optional[int] = None,
         prompt_logprobs: Optional[int] = None,
@@ -486,7 +493,11 @@ class SamplingParams(
             "spaces_between_special_tokens="
             f"{self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
-            f"guided_decoding={self.guided_decoding})")
+            f"guided_decoding={self.guided_decoding}, "
+            f"offload={self.offload}, "
+            f"prefill_rank={self.prefill_rank}, "
+            ")"
+        )
 
 
 class BeamSearchParams(

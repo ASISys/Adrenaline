@@ -8,6 +8,7 @@ import torch.distributed
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.distributed.utils import TransferUtils
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
@@ -26,6 +27,9 @@ from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
+import vllm.distributed.kv_transfer.vllm_adapter as dist_kv
+from adrenaline.model_runner.model_runner import ModelRunner as AdrenalineModelRunner
+from adrenaline.model_runner.attn_runner import AttentionRunner
 
 logger = init_logger(__name__)
 
@@ -79,6 +83,12 @@ class Worker(LocalOrDistributedWorkerBase):
             ModelRunnerClass = EmbeddingModelRunner
         elif self._is_encoder_decoder_model():
             ModelRunnerClass = EncoderDecoderModelRunner
+        elif dist_kv.ENABLE_KV_OFFLOAD:
+            if dist_kv.IS_KV_PRODUCER or dist_kv.IS_KV_CONSUMER:
+                ModelRunnerClass = AdrenalineModelRunner
+            elif dist_kv.IS_ATTN_EXECUTOR:
+                ModelRunnerClass = AttentionRunner
+
         self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
             vllm_config=self.vllm_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
@@ -144,10 +154,19 @@ class Worker(LocalOrDistributedWorkerBase):
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
+
+        transfer_utils = TransferUtils(
+            hidden_size = self.vllm_config.model_config.get_hidden_size(),
+            num_kv_heads = self.vllm_config.model_config.get_num_kv_heads(self.vllm_config.parallel_config),
+            num_layers = self.vllm_config.model_config.get_num_layers(self.vllm_config.parallel_config),
+            head_size = self.vllm_config.model_config.get_head_size(),
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            kv_dtype=self.vllm_config.model_config.dtype
+        )
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
-                                            self.local_rank)
+                                            self.local_rank, transfer_utils=transfer_utils)
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -455,6 +474,7 @@ def init_worker_distributed_environment(
     rank: int,
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
+    transfer_utils: Optional[TransferUtils] = None,
 ) -> None:
     """Initialize the distributed environment."""
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
@@ -463,7 +483,8 @@ def init_worker_distributed_environment(
                                  distributed_init_method, local_rank)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+                                      parallel_config.pipeline_parallel_size,
+                                      transfer_utils=transfer_utils)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
@@ -496,9 +517,10 @@ def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "
                          "initializing the engine.")
+    logger.debug(f"{block_size*num_gpu_blocks=}, {max_model_len=}")
     max_seq_len = block_size * num_gpu_blocks
     if not is_attention_free and max_model_len > max_seq_len:
-        raise ValueError(
+        logger.warning(
             f"The model's max seq len ({max_model_len}) "
             "is larger than the maximum number of tokens that can be "
             f"stored in KV cache ({max_seq_len}). Try increasing "

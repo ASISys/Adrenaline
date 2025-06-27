@@ -627,6 +627,10 @@ def make_kv_cache(num_blocks: int,
     elif backend == 'FLASH_ATTN':
         kv_cache = torch.rand(
             (2, num_blocks, block_size, num_heads, head_size)).to(device)
+    elif backend == 'FLASHINFER':
+        kv_cache = torch.rand((num_blocks, 2, block_size, num_heads, head_size)).to(
+            device
+        )
     else:
         raise ValueError(
             f"Unknown backend value: '{backend}'. Expected 'XFORMERS' or "

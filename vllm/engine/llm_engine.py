@@ -16,8 +16,13 @@ import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
-from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
-                                 SchedulerOutputs)
+from vllm.core.scheduler import (
+    ScheduledSequenceGroup,
+    Scheduler,
+    SchedulerOutputs,
+    is_recv_fin_scheduler_outputs,
+)
+from vllm.distributed.kv_transfer import vllm_adapter as dist_kv
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -1098,6 +1103,9 @@ class LLMEngine:
              is_last_step, is_first_step_output,
              skip) = ctx.output_queue.popleft()
 
+        if len(outputs) == 0:
+            return None
+
         # Sanity check
         assert len(seq_group_metadata_list) == len(
             scheduler_outputs.scheduled_seq_groups)
@@ -1404,6 +1412,7 @@ class LLMEngine:
         # Clear outputs for each new scheduler iteration
         ctx.request_outputs.clear()
 
+        step_start_time = time.perf_counter()
         # Skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
         # batch has completed.
@@ -1458,8 +1467,27 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
+            block_timestamp = time.perf_counter()
             outputs = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
+            step_stop_time = time.perf_counter()
+            # TODO: add record step flags
+            # times 1000 to convert to ms
+            step_time = (step_stop_time - step_start_time) * 1000
+            scheduler = self.scheduler[virtual_engine]
+            output_tokens = len([sg.seq_group for sg in scheduler_outputs.scheduled_seq_groups])
+            num_blocks = sum([metadata.num_blocks for metadata in seq_group_metadata_list])
+            avg_seq_lens = sum([sg.seq_group.get_seq_lens() for sg in scheduler_outputs.scheduled_seq_groups]) / output_tokens
+            if dist_kv.IS_KV_CONSUMER or dist_kv.IS_ATTN_EXECUTOR:
+                if not scheduler_outputs.scheduled_seq_groups[0].seq_group.is_prefill():
+                    logger.debug(f"{step_time=}, {output_tokens=}({len(scheduler.running)}+{len(scheduler.offloaded)}), {num_blocks=}, {avg_seq_lens=}, {len(scheduler.swapped)=}")
+                    logger.debug(f"record blocks: {num_blocks=}, timestamp={step_stop_time}")
+                else:
+                    is_recv_fin = is_recv_fin_scheduler_outputs(scheduler_outputs)
+                    logger.debug(f"prefill step: {is_recv_fin=}, {step_start_time=}, {step_stop_time=}, scheduled_request_ids={[sg.seq_group.request_id for sg in scheduler_outputs.scheduled_seq_groups]}")
+            elif dist_kv.IS_KV_PRODUCER:
+                logger.debug(f"{step_time=}, {output_tokens=}({len(scheduler.running)}+{len(scheduler.offloaded)}), {num_blocks=}, {avg_seq_lens=}, {len(scheduler.swapped)=}")
+                logger.debug(f"record blocks: {num_blocks=}, timestamp={block_timestamp}")
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
@@ -1523,6 +1551,9 @@ class LLMEngine:
             if len(ctx.output_queue) > 0:
                 self._process_model_outputs(ctx=ctx)
             assert len(ctx.output_queue) == 0
+
+            timestamp = time.perf_counter()
+            logger.debug(f"record blocks: num_blocks=0, timestamp={timestamp}")
 
             # Stop the execute model loop in parallel workers until there are
             # more requests to process. This avoids waiting indefinitely in
