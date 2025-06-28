@@ -57,6 +57,8 @@ def plot_step_times(
     start_idx, end_idx = stable_range
     pyplot.vlines(start_idx, 0, max(step_times), colors="r", linestyles="dashed")
     pyplot.vlines(end_idx, 0, max(step_times), colors="r", linestyles="dashed")
+    if max(step_times) > 100:
+        pyplot.ylim([0, 100])
     path = Path(output_path)
     os.makedirs(path.parent, exist_ok=True)
     pyplot.savefig(output_path)
